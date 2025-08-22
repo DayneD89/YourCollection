@@ -1,0 +1,135 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Cost Management - Environment-specific budgets and automated controls
+
+Parameters:
+  ProjectName:
+    Type: String
+    Description: Base name for all resources
+    
+  Environment:
+    Type: String
+    Description: Environment identifier
+    
+  MonthlyBudgetLimit:
+    Type: Number
+    Default: 100
+    Description: Monthly budget limit in GBP for this environment
+    
+  AlertEmail:
+    Type: String
+    Default: admin@party-collection.local
+    Description: Email for budget alerts
+    
+  EmergencyShutdownThreshold:
+    Type: Number
+    Default: 95
+    Description: Emergency shutdown at % of budget (95 = 95%)
+
+Resources:
+  # SNS Topic for Cost Alerts
+  CostAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-${Environment}-cost-alerts"
+
+  # Email Subscription
+  CostAlertSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref CostAlertTopic
+      Endpoint: !Ref AlertEmail
+
+  # Environment Budget with Tag Filter
+  EnvironmentBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: !Sub "${ProjectName}-${Environment}-budget"
+        BudgetLimit:
+          Amount: !Ref MonthlyBudgetLimit
+          Unit: GBP
+        TimeUnit: MONTHLY
+        BudgetType: COST
+        CostFilters:
+          TagKey: ["Environment"]
+          TagValue: [!Ref Environment]
+        NotificationsWithSubscribers:
+          - Notification:
+              NotificationType: ACTUAL
+              ComparisonOperator: GREATER_THAN
+              Threshold: 50
+              ThresholdType: PERCENTAGE
+            Subscribers:
+              - SubscriptionType: SNS
+                Address: !Ref CostAlertTopic
+          - Notification:
+              NotificationType: ACTUAL
+              ComparisonOperator: GREATER_THAN
+              Threshold: 80
+              ThresholdType: PERCENTAGE
+            Subscribers:
+              - SubscriptionType: SNS
+                Address: !Ref CostAlertTopic
+
+  # Emergency Shutdown Lambda
+  EmergencyShutdownFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-${Environment}-emergency-shutdown"
+      InlineCode: |
+        import boto3
+        import json
+        import os
+        
+        def lambda_handler(event, context):
+            environment = os.environ['ENVIRONMENT']
+            project_name = os.environ['PROJECT_NAME']
+            
+            print(f"Emergency shutdown triggered for {environment}")
+            
+            try:
+                # Scale ECS services to 0
+                ecs = boto3.client('ecs')
+                cluster_name = f"{project_name}-{environment}-cluster"
+                
+                services = ecs.list_services(cluster=cluster_name)
+                for service_arn in services['serviceArns']:
+                    service_name = service_arn.split('/')[-1]
+                    ecs.update_service(
+                        cluster=cluster_name,
+                        service=service_name,
+                        desiredCount=0
+                    )
+                
+                return {'statusCode': 200, 'body': f'Emergency shutdown completed'}
+                
+            except Exception as e:
+                print(f"Error: {str(e)}")
+                return {'statusCode': 500, 'body': str(e)}
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - ecs:*
+                - rds:StopDBInstance
+                - rds:DescribeDBInstances
+              Resource: '*'
+
+Outputs:
+  BudgetLimit:
+    Description: Monthly budget limit
+    Value: !Sub "£${MonthlyBudgetLimit}"
+    
+  AlertTopicArn:
+    Description: SNS topic for cost alerts
+    Value: !Ref CostAlertTopic

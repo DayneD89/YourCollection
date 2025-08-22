@@ -1,0 +1,30 @@
+{
+  "name": "party-collection-tests",
+  "version": "1.0.0",
+  "description": "Combined backend and frontend tests for Party Collection system",
+  "main": "runner.js",
+  "scripts": {
+    "test": "node runner.js",
+    "clean": "../infra/local/scripts/stop-local.sh --clean && ../infra/local/scripts/start-local.sh",
+    "report": "node generate-tag-report.js",
+    "full_run": "pwd && ../infra/local/scripts/stop-local.sh --clean && ../infra/local/scripts/start-local.sh && node runner.js && node generate-tag-report.js"
+  },
+  "keywords": [
+    "testing",
+    "e2e",
+    "backend",
+    "frontend",
+    "cucumber"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "js-yaml": "^4.1.0",
+    "jsonwebtoken": "^9.0.2"
+  },
+  "devDependencies": {
+    "@cucumber/cucumber": "^11.3.0",
+    "chromedriver": "^139.0.2",
+    "selenium-webdriver": "^4.23.0"
+  }
+}

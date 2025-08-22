@@ -1,0 +1,49 @@
+# SAM build artifacts
+.aws-sam/
+build/
+dist/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# AWS credentials and config
+.aws/
+credentials
+config
+
+# Parameter files with sensitive data
+parameters/*-sensitive.json
+*-secrets.json
+
+# SAM cache
+samconfig.toml.bak
+
+# Deployment artifacts
+packaged-template.yaml
+*.zip
+
+# Temporary files
+*.tmp
+*.temp
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# CloudFormation outputs
+outputs.json
+stack-outputs.json
+
+# Cost analysis cache
+cost-analysis-cache/
+
+# Template validation cache
+.template-cache/

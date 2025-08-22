@@ -1,0 +1,226 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Networking Substack - ALB and Security Groups
+  
+  Application Load Balancer with blue-green deployment support.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Description: Base name for all resources
+    
+  Environment:
+    Type: String
+    Description: Environment identifier
+    
+  GlobalStackName:
+    Type: String
+    Description: Name of the global stack for imports
+    
+  EnableBlueGreen:
+    Type: String
+    Default: "false"
+    Description: Enable blue-green target groups
+    AllowedValues: ["true", "false"]
+    
+  DomainName:
+    Type: String
+    Default: ""
+    Description: Custom domain name (leave empty for none)
+    
+  CertificateArn:
+    Type: String
+    Default: ""
+    Description: SSL certificate ARN (leave empty for none)
+
+Conditions:
+  HasBlueGreen: !Equals [!Ref EnableBlueGreen, "true"]
+  HasDomain: !Not [!Equals [!Ref DomainName, ""]]
+  HasCertificate: !Not [!Equals [!Ref CertificateArn, ""]]
+
+Resources:
+  # Application Load Balancer Security Group
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Application Load Balancer
+      VpcId:
+        Fn::ImportValue: !Sub "${GlobalStackName}-VPC"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP access from internet
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS access from internet
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-alb-sg"
+
+  # Application Load Balancer
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-alb"
+      Type: application
+      IpAddressType: ipv4
+      Scheme: internet-facing
+      Subnets:
+        - Fn::ImportValue: !Sub "${GlobalStackName}-PublicSubnet1"
+        - Fn::ImportValue: !Sub "${GlobalStackName}-PublicSubnet2"
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Target Groups for Blue/Green Deployment
+  BackendTargetGroupBlue:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: HasBlueGreen
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-backend-blue"
+      Port: 3001
+      Protocol: HTTP
+      VpcId:
+        Fn::ImportValue: !Sub "${GlobalStackName}-VPC"
+      TargetType: ip
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: BlueGreen
+          Value: Blue
+
+  BackendTargetGroupGreen:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: HasBlueGreen
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-backend-green"
+      Port: 3001
+      Protocol: HTTP
+      VpcId:
+        Fn::ImportValue: !Sub "${GlobalStackName}-VPC"
+      TargetType: ip
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: BlueGreen
+          Value: Green
+
+  # Standard Target Group (when not using blue-green)
+  BackendTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: !Not [!Condition HasBlueGreen]
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-backend"
+      Port: 3001
+      Protocol: HTTP
+      VpcId:
+        Fn::ImportValue: !Sub "${GlobalStackName}-VPC"
+      TargetType: ip
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Frontend Target Group
+  FrontendTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-frontend"
+      Port: 3000
+      Protocol: HTTP
+      VpcId:
+        Fn::ImportValue: !Sub "${GlobalStackName}-VPC"
+      TargetType: ip
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ALB Listeners
+  ALBListenerHTTP:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !If
+            - HasBlueGreen
+            - !Ref BackendTargetGroupBlue
+            - !Ref BackendTargetGroup
+
+  ALBListenerHTTPS:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasCertificate
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !If
+            - HasBlueGreen
+            - !Ref BackendTargetGroupBlue
+            - !Ref BackendTargetGroup
+
+Outputs:
+  ALBDNSName:
+    Description: ALB DNS name
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    
+  ALBArn:
+    Description: ALB ARN
+    Value: !Ref ApplicationLoadBalancer
+    
+  TargetGroupArn:
+    Description: Primary target group ARN
+    Value: !If
+      - HasBlueGreen
+      - !Ref BackendTargetGroupBlue
+      - !Ref BackendTargetGroup
+      
+  BlueTargetGroupArn:
+    Description: Blue target group ARN (if blue-green enabled)
+    Value: !If
+      - HasBlueGreen
+      - !Ref BackendTargetGroupBlue
+      - "Blue-green not enabled"
+      
+  GreenTargetGroupArn:
+    Description: Green target group ARN (if blue-green enabled)
+    Value: !If
+      - HasBlueGreen
+      - !Ref BackendTargetGroupGreen
+      - "Blue-green not enabled"
+      
+  ALBSecurityGroupId:
+    Description: ALB security group ID
+    Value: !Ref ALBSecurityGroup

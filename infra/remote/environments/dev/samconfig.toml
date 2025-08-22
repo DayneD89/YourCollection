@@ -1,0 +1,45 @@
+# SAM CLI configuration for development environment
+version = 0.1
+
+[default]
+[default.global]
+[default.global.parameters]
+stack_name = "party-collection-dev"
+s3_bucket = ""  # Will use bucket from global stack
+s3_prefix = "dev"
+region = "us-east-1"
+capabilities = "CAPABILITY_IAM"
+parameter_overrides = ""
+image_repositories = []
+
+[default.build]
+[default.build.parameters]
+cached = true
+parallel = true
+
+[default.validate]
+[default.validate.parameters]
+lint = true
+
+[default.deploy]
+[default.deploy.parameters]
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+fail_on_empty_changeset = false
+resolve_s3 = true
+
+[default.package]
+[default.package.parameters]
+resolve_s3 = true
+
+[default.sync]
+[default.sync.parameters]
+watch = true
+
+[default.local_start_api]
+[default.local_start_api.parameters]
+warm_containers = "EAGER"
+
+[default.local_start_lambda]
+[default.local_start_lambda.parameters]
+warm_containers = "EAGER"

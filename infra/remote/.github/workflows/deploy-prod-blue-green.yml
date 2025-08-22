@@ -1,0 +1,683 @@
+name: Blue/Green Production Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_production:
+        description: 'Type "deploy-to-production" to confirm deployment'
+        required: true
+        type: string
+      deployment_color:
+        description: 'Deployment color (blue or green)'
+        required: true
+        default: 'green'
+        type: choice
+        options:
+          - green
+          - blue
+      rollback_if_unhealthy:
+        description: 'Automatically rollback if health checks fail'
+        required: false
+        default: true
+        type: boolean
+      health_check_timeout:
+        description: 'Health check timeout in minutes'
+        required: false
+        default: 10
+        type: number
+  push:
+    branches:
+      - main
+    paths:
+      - 'backend/**'
+      - 'frontend/**'
+      - 'infra/remote/environments/prod/**'
+      - '.github/workflows/deploy-prod-blue-green.yml'
+
+env:
+  AWS_REGION: eu-west-2  # UK region
+  SAM_CLI_TELEMETRY: 0
+  ENVIRONMENT: prod
+
+# Required for OIDC authentication
+permissions:
+  id-token: write
+  contents: read
+  deployments: write
+
+jobs:
+  validate-inputs:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    outputs:
+      deployment_color: ${{ steps.determine-color.outputs.deployment_color }}
+    steps:
+      - name: Validate production confirmation
+        run: |
+          if [ "${{ github.event.inputs.confirm_production }}" != "deploy-to-production" ]; then
+            echo "❌ Production deployment requires confirmation"
+            echo "Please type 'deploy-to-production' in the confirmation field"
+            exit 1
+          fi
+          echo "✅ Production deployment confirmed"
+
+      - name: Determine deployment color
+        id: determine-color
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            COLOR="${{ github.event.inputs.deployment_color }}"
+          else
+            # Auto-determine color based on current active deployment
+            COLOR="green"  # Default for push events
+          fi
+          echo "deployment_color=$COLOR" >> $GITHUB_OUTPUT
+          echo "🎨 Deploying to: $COLOR environment"
+
+  build-and-test:
+    runs-on: ubuntu-latest
+    needs: [validate-inputs]
+    if: always() && (needs.validate-inputs.result == 'success' || github.event_name == 'push')
+    outputs:
+      backend-image: ${{ steps.build.outputs.backend-image }}
+      frontend-image: ${{ steps.build.outputs.frontend-image }}
+      deployment_color: ${{ needs.validate-inputs.outputs.deployment_color || 'green' }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: |
+            backend/package-lock.json
+            frontend/package-lock.json
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/party-collection-github-actions-role
+          role-session-name: GitHubActions-ProdBuild
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Install and test backend
+        run: |
+          cd backend
+          npm ci
+          npm run test
+          npm run lint || true  # Don't fail on lint warnings
+
+      - name: Install and test frontend
+        run: |
+          cd frontend
+          npm ci
+          npm run lint || true  # Don't fail on lint warnings
+          npm run build
+
+      - name: Security scan dependencies
+        run: |
+          cd backend && npm audit --audit-level=high || true
+          cd frontend && npm audit --audit-level=high || true
+
+      - name: Build production backend container
+        id: build-backend
+        run: |
+          cd backend
+          
+          # Create optimized production Dockerfile
+          cat > Dockerfile << 'EOF'
+          FROM node:18-alpine AS builder
+          WORKDIR /app
+          COPY package*.json ./
+          RUN npm ci --only=production && npm cache clean --force
+          COPY . .
+          RUN npm run build
+
+          FROM node:18-alpine
+          RUN addgroup -g 1001 -S nodejs && adduser -S appuser -u 1001 -G nodejs
+          
+          # Install curl for health checks
+          RUN apk add --no-cache curl
+          
+          WORKDIR /app
+          COPY package*.json ./
+          RUN npm ci --only=production && npm cache clean --force
+          
+          COPY --from=builder --chown=appuser:nodejs /app/dist ./dist
+          COPY --from=builder --chown=appuser:nodejs /app/package.json ./
+          
+          # Create health check endpoint script
+          RUN echo '#!/bin/sh\ncurl -f http://localhost:3001/health || exit 1' > /app/healthcheck.sh && \
+              chmod +x /app/healthcheck.sh && \
+              chown appuser:nodejs /app/healthcheck.sh
+          
+          USER appuser
+          EXPOSE 3001
+          
+          HEALTHCHECK --interval=30s --timeout=3s --start-period=40s --retries=3 \
+            CMD /app/healthcheck.sh
+          
+          CMD ["npm", "start"]
+          EOF
+          
+          # Build and push image with multiple tags
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          IMAGE_URI=${{ steps.login-ecr.outputs.registry }}/party-collection-backend:${{ env.ENVIRONMENT }}-${{ github.sha }}
+          LATEST_URI=${{ steps.login-ecr.outputs.registry }}/party-collection-backend:${{ env.ENVIRONMENT }}-latest
+          TIMESTAMP_URI=${{ steps.login-ecr.outputs.registry }}/party-collection-backend:${{ env.ENVIRONMENT }}-${TIMESTAMP}
+          
+          docker build -t $IMAGE_URI -t $LATEST_URI -t $TIMESTAMP_URI .
+          docker push $IMAGE_URI
+          docker push $LATEST_URI
+          docker push $TIMESTAMP_URI
+          
+          echo "backend-image=$IMAGE_URI" >> $GITHUB_OUTPUT
+          echo "🐳 Backend image: $IMAGE_URI"
+
+      - name: Build production frontend container
+        id: build-frontend
+        run: |
+          cd frontend
+          
+          # Create optimized production Dockerfile
+          cat > Dockerfile << 'EOF'
+          FROM node:18-alpine AS builder
+          WORKDIR /app
+          COPY package*.json ./
+          RUN npm ci
+          COPY . .
+          RUN npm run build
+
+          FROM node:18-alpine
+          RUN addgroup -g 1001 -S nodejs && adduser -S nextjs -u 1001 -G nodejs
+          
+          # Install curl for health checks
+          RUN apk add --no-cache curl
+          
+          WORKDIR /app
+          COPY package*.json ./
+          RUN npm ci --only=production && npm cache clean --force
+          
+          COPY --from=builder --chown=nextjs:nodejs /app/.next ./.next
+          COPY --from=builder --chown=nextjs:nodejs /app/public ./public
+          COPY --from=builder --chown=nextjs:nodejs /app/package.json ./
+          
+          # Create health check endpoint script
+          RUN echo '#!/bin/sh\ncurl -f http://localhost:3000/ || exit 1' > /app/healthcheck.sh && \
+              chmod +x /app/healthcheck.sh && \
+              chown nextjs:nodejs /app/healthcheck.sh
+          
+          USER nextjs
+          EXPOSE 3000
+          
+          HEALTHCHECK --interval=30s --timeout=3s --start-period=40s --retries=3 \
+            CMD /app/healthcheck.sh
+          
+          CMD ["npm", "start"]
+          EOF
+          
+          # Build and push image with multiple tags
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          IMAGE_URI=${{ steps.login-ecr.outputs.registry }}/party-collection-frontend:${{ env.ENVIRONMENT }}-${{ github.sha }}
+          LATEST_URI=${{ steps.login-ecr.outputs.registry }}/party-collection-frontend:${{ env.ENVIRONMENT }}-latest
+          TIMESTAMP_URI=${{ steps.login-ecr.outputs.registry }}/party-collection-frontend:${{ env.ENVIRONMENT }}-${TIMESTAMP}
+          
+          docker build -t $IMAGE_URI -t $LATEST_URI -t $TIMESTAMP_URI .
+          docker push $IMAGE_URI
+          docker push $LATEST_URI
+          docker push $TIMESTAMP_URI
+          
+          echo "frontend-image=$IMAGE_URI" >> $GITHUB_OUTPUT
+          echo "🐳 Frontend image: $IMAGE_URI"
+
+      - name: Set build outputs
+        id: build
+        run: |
+          echo "backend-image=${{ steps.build-backend.outputs.backend-image }}" >> $GITHUB_OUTPUT
+          echo "frontend-image=${{ steps.build-frontend.outputs.frontend-image }}" >> $GITHUB_OUTPUT
+
+  deploy-infrastructure:
+    runs-on: ubuntu-latest
+    needs: [build-and-test]
+    environment: production
+    outputs:
+      deployment_status: ${{ steps.deployment.outputs.status }}
+      backend_service_name: ${{ steps.deployment.outputs.backend_service_name }}
+      frontend_service_name: ${{ steps.deployment.outputs.frontend_service_name }}
+      load_balancer_url: ${{ steps.deployment.outputs.load_balancer_url }}
+    
+    steps:
+      - name: Create deployment record
+        uses: actions/github-script@v7
+        id: deployment
+        with:
+          script: |
+            const deployment = await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: context.sha,
+              environment: 'production',
+              description: `Blue/Green deployment to ${{ needs.build-and-test.outputs.deployment_color }}`,
+              required_contexts: [],
+              auto_merge: false
+            });
+            return deployment.data.id;
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python for SAM CLI
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Setup SAM CLI
+        uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/party-collection-prod-deployment-role
+          role-session-name: GitHubActions-ProdDeploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get current deployment color
+        id: current-color
+        run: |
+          # Check which color is currently active by looking at ALB rules
+          CURRENT_BACKEND_TG=$(aws elbv2 describe-rules \
+            --listener-arn $(aws elbv2 describe-listeners \
+              --load-balancer-arn $(aws elbv2 describe-load-balancers \
+                --names party-collection-prod-alb \
+                --query 'LoadBalancers[0].LoadBalancerArn' --output text) \
+              --query 'Listeners[?Port==`443`].ListenerArn' --output text) \
+            --query 'Rules[?Priority==`100`].Actions[0].TargetGroupArn' --output text 2>/dev/null || echo "")
+          
+          if [[ "$CURRENT_BACKEND_TG" == *"blue"* ]]; then
+            CURRENT_COLOR="blue"
+            NEW_COLOR="green"
+          else
+            CURRENT_COLOR="green" 
+            NEW_COLOR="blue"
+          fi
+          
+          # Override with manual selection if provided
+          if [ "${{ needs.build-and-test.outputs.deployment_color }}" != "" ]; then
+            NEW_COLOR="${{ needs.build-and-test.outputs.deployment_color }}"
+          fi
+          
+          echo "current_color=$CURRENT_COLOR" >> $GITHUB_OUTPUT
+          echo "new_color=$NEW_COLOR" >> $GITHUB_OUTPUT
+          echo "🎨 Current: $CURRENT_COLOR → Deploying: $NEW_COLOR"
+
+      - name: Deploy infrastructure
+        id: infrastructure
+        run: |
+          cd infra/remote/environments/prod
+          
+          # Use blue-green template
+          cp template-blue-green.yaml template.yaml
+          
+          sam deploy \
+            --stack-name party-collection-prod \
+            --template-file template-blue-green.yaml \
+            --capabilities CAPABILITY_IAM \
+            --region ${{ env.AWS_REGION }} \
+            --s3-bucket party-collection-sam-state-${{ secrets.AWS_ACCOUNT_ID }} \
+            --s3-prefix prod \
+            --parameter-overrides \
+              ProjectName=party-collection \
+              Environment=prod \
+              GlobalStackName=party-collection-global \
+              BackendImage=${{ needs.build-and-test.outputs.backend-image }} \
+              FrontendImage=${{ needs.build-and-test.outputs.frontend-image }} \
+              DomainName=party-collection.co.uk \
+              DeploymentTimeoutMinutes=15 \
+              HealthCheckGracePeriodSeconds=300 \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset
+
+      - name: Deploy to new color environment
+        id: deploy-new-color
+        run: |
+          NEW_COLOR="${{ steps.current-color.outputs.new_color }}"
+          echo "🚀 Deploying to $NEW_COLOR environment"
+          
+          # Update the new color service with new task definition
+          CLUSTER_NAME="party-collection-prod-cluster"
+          BACKEND_SERVICE="${NEW_COLOR}"
+          FRONTEND_SERVICE="${NEW_COLOR}"
+          
+          # Update backend service
+          aws ecs update-service \
+            --cluster $CLUSTER_NAME \
+            --service "party-collection-prod-backend-${NEW_COLOR}" \
+            --task-definition party-collection-prod-backend \
+            --force-new-deployment
+          
+          # Update frontend service  
+          aws ecs update-service \
+            --cluster $CLUSTER_NAME \
+            --service "party-collection-prod-frontend-${NEW_COLOR}" \
+            --task-definition party-collection-prod-frontend \
+            --force-new-deployment
+          
+          echo "backend_service=party-collection-prod-backend-${NEW_COLOR}" >> $GITHUB_OUTPUT
+          echo "frontend_service=party-collection-prod-frontend-${NEW_COLOR}" >> $GITHUB_OUTPUT
+
+      - name: Wait for new deployment to be healthy
+        id: health-check
+        run: |
+          NEW_COLOR="${{ steps.current-color.outputs.new_color }}"
+          CLUSTER_NAME="party-collection-prod-cluster"
+          TIMEOUT_MINUTES="${{ github.event.inputs.health_check_timeout || 10 }}"
+          
+          echo "⏳ Waiting for $NEW_COLOR deployment to be healthy (timeout: ${TIMEOUT_MINUTES}m)"
+          
+          # Wait for services to be stable
+          aws ecs wait services-stable \
+            --cluster $CLUSTER_NAME \
+            --services \
+              "party-collection-prod-backend-${NEW_COLOR}" \
+              "party-collection-prod-frontend-${NEW_COLOR}" \
+            --cli-read-timeout 0 \
+            --cli-connect-timeout 60
+          
+          # Additional health checks
+          BACKEND_TG_ARN=$(aws cloudformation describe-stacks \
+            --stack-name party-collection-prod \
+            --query "Stacks[0].Outputs[?OutputKey=='BackendTargetGroup${NEW_COLOR^}'].OutputValue" \
+            --output text)
+          
+          FRONTEND_TG_ARN=$(aws cloudformation describe-stacks \
+            --stack-name party-collection-prod \
+            --query "Stacks[0].Outputs[?OutputKey=='FrontendTargetGroup${NEW_COLOR^}'].OutputValue" \
+            --output text)
+          
+          # Check target group health
+          for i in {1..30}; do
+            BACKEND_HEALTHY=$(aws elbv2 describe-target-health \
+              --target-group-arn $BACKEND_TG_ARN \
+              --query 'TargetHealthDescriptions[?TargetHealth.State==`healthy`]' \
+              --output text | wc -l)
+            
+            FRONTEND_HEALTHY=$(aws elbv2 describe-target-health \
+              --target-group-arn $FRONTEND_TG_ARN \
+              --query 'TargetHealthDescriptions[?TargetHealth.State==`healthy`]' \
+              --output text | wc -l)
+            
+            if [ "$BACKEND_HEALTHY" -ge "2" ] && [ "$FRONTEND_HEALTHY" -ge "2" ]; then
+              echo "✅ All targets healthy in $NEW_COLOR environment"
+              echo "health_status=healthy" >> $GITHUB_OUTPUT
+              break
+            fi
+            
+            echo "🔄 Health check $i/30: Backend healthy: $BACKEND_HEALTHY, Frontend healthy: $FRONTEND_HEALTHY"
+            sleep 30
+          done
+          
+          if [ "$i" -eq "30" ]; then
+            echo "❌ Health check timeout"
+            echo "health_status=unhealthy" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+      - name: Switch traffic to new environment
+        id: switch-traffic
+        if: steps.health-check.outputs.health_status == 'healthy'
+        run: |
+          NEW_COLOR="${{ steps.current-color.outputs.new_color }}"
+          echo "🔀 Switching traffic to $NEW_COLOR environment"
+          
+          # Get target group ARNs
+          BACKEND_TG_ARN=$(aws cloudformation describe-stacks \
+            --stack-name party-collection-prod \
+            --query "Stacks[0].Outputs[?OutputKey=='BackendTargetGroup${NEW_COLOR^}'].OutputValue" \
+            --output text)
+          
+          FRONTEND_TG_ARN=$(aws cloudformation describe-stacks \
+            --stack-name party-collection-prod \
+            --query "Stacks[0].Outputs[?OutputKey=='FrontendTargetGroup${NEW_COLOR^}'].OutputValue" \
+            --output text)
+          
+          # Get listener ARNs
+          ALB_ARN=$(aws elbv2 describe-load-balancers \
+            --names party-collection-prod-alb \
+            --query 'LoadBalancers[0].LoadBalancerArn' --output text)
+          
+          HTTPS_LISTENER_ARN=$(aws elbv2 describe-listeners \
+            --load-balancer-arn $ALB_ARN \
+            --query 'Listeners[?Port==`443`].ListenerArn' --output text)
+          
+          HTTP_LISTENER_ARN=$(aws elbv2 describe-listeners \
+            --load-balancer-arn $ALB_ARN \
+            --query 'Listeners[?Port==`80`].ListenerArn' --output text)
+          
+          # Update HTTPS listener default action for frontend
+          aws elbv2 modify-listener \
+            --listener-arn $HTTPS_LISTENER_ARN \
+            --default-actions Type=forward,TargetGroupArn=$FRONTEND_TG_ARN
+          
+          # Update HTTP listener default action for frontend  
+          aws elbv2 modify-listener \
+            --listener-arn $HTTP_LISTENER_ARN \
+            --default-actions Type=forward,TargetGroupArn=$FRONTEND_TG_ARN
+          
+          # Update backend listener rule
+          BACKEND_RULE_ARN=$(aws elbv2 describe-rules \
+            --listener-arn $HTTPS_LISTENER_ARN \
+            --query 'Rules[?Priority==`100`].RuleArn' --output text)
+          
+          aws elbv2 modify-rule \
+            --rule-arn $BACKEND_RULE_ARN \
+            --actions Type=forward,TargetGroupArn=$BACKEND_TG_ARN
+          
+          echo "✅ Traffic switched to $NEW_COLOR environment"
+          echo "switch_status=success" >> $GITHUB_OUTPUT
+
+      - name: Verify new deployment
+        id: verify
+        if: steps.switch-traffic.outputs.switch_status == 'success'
+        run: |
+          # Get application URL
+          APP_URL=$(aws cloudformation describe-stacks \
+            --stack-name party-collection-prod \
+            --query 'Stacks[0].Outputs[?OutputKey==`LoadBalancerURL`].OutputValue' \
+            --output text)
+          
+          echo "🧪 Verifying deployment at: $APP_URL"
+          
+          # Test application endpoints
+          for i in {1..10}; do
+            # Test health endpoint
+            if curl -sf "$APP_URL/health" > /dev/null; then
+              echo "✅ Health check passed"
+              break
+            fi
+            echo "🔄 Verification attempt $i/10"
+            sleep 10
+          done
+          
+          # Test frontend
+          if curl -sf "$APP_URL/" > /dev/null; then
+            echo "✅ Frontend verification passed"
+          else
+            echo "❌ Frontend verification failed"
+            exit 1
+          fi
+          
+          echo "verification_status=success" >> $GITHUB_OUTPUT
+
+      - name: Scale down old environment
+        id: scale-down-old
+        if: steps.verify.outputs.verification_status == 'success'
+        run: |
+          OLD_COLOR="${{ steps.current-color.outputs.current_color }}"
+          CLUSTER_NAME="party-collection-prod-cluster"
+          
+          echo "📉 Scaling down $OLD_COLOR environment"
+          
+          # Scale down old services to 0
+          aws ecs update-service \
+            --cluster $CLUSTER_NAME \
+            --service "party-collection-prod-backend-${OLD_COLOR}" \
+            --desired-count 0
+          
+          aws ecs update-service \
+            --cluster $CLUSTER_NAME \
+            --service "party-collection-prod-frontend-${OLD_COLOR}" \
+            --desired-count 0
+          
+          echo "✅ Old $OLD_COLOR environment scaled down"
+
+      - name: Set deployment outputs
+        id: deployment
+        run: |
+          APP_URL=$(aws cloudformation describe-stacks \
+            --stack-name party-collection-prod \
+            --query 'Stacks[0].Outputs[?OutputKey==`LoadBalancerURL`].OutputValue' \
+            --output text)
+          
+          echo "status=success" >> $GITHUB_OUTPUT
+          echo "load_balancer_url=$APP_URL" >> $GITHUB_OUTPUT
+          echo "backend_service_name=${{ steps.deploy-new-color.outputs.backend_service }}" >> $GITHUB_OUTPUT
+          echo "frontend_service_name=${{ steps.deploy-new-color.outputs.frontend_service }}" >> $GITHUB_OUTPUT
+
+      - name: Update deployment status - success
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: ${{ steps.deployment.outputs.result }},
+              state: 'success',
+              environment_url: '${{ steps.deployment.outputs.load_balancer_url }}',
+              description: 'Blue/Green deployment successful'
+            });
+
+      - name: Update deployment status - failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: ${{ steps.deployment.outputs.result }},
+              state: 'failure',
+              description: 'Blue/Green deployment failed'
+            });
+
+  rollback-on-failure:
+    runs-on: ubuntu-latest
+    needs: [build-and-test, deploy-infrastructure]
+    if: failure() && github.event.inputs.rollback_if_unhealthy == 'true'
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/party-collection-prod-deployment-role
+          role-session-name: GitHubActions-Rollback
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Rollback deployment
+        run: |
+          echo "🔄 Initiating automatic rollback"
+          
+          # Stop any new deployments in progress
+          CLUSTER_NAME="party-collection-prod-cluster" 
+          NEW_COLOR="${{ needs.build-and-test.outputs.deployment_color }}"
+          
+          # Scale down failed deployment
+          aws ecs update-service \
+            --cluster $CLUSTER_NAME \
+            --service "party-collection-prod-backend-${NEW_COLOR}" \
+            --desired-count 0
+          
+          aws ecs update-service \
+            --cluster $CLUSTER_NAME \
+            --service "party-collection-prod-frontend-${NEW_COLOR}" \
+            --desired-count 0
+          
+          echo "✅ Rollback completed - failed deployment scaled down"
+
+  run-smoke-tests:
+    runs-on: ubuntu-latest
+    needs: [build-and-test, deploy-infrastructure]
+    if: needs.deploy-infrastructure.outputs.deployment_status == 'success'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/party-collection-github-actions-role
+          role-session-name: GitHubActions-SmokeTest
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Run smoke tests
+        run: |
+          cd frontend
+          npm ci
+          
+          export NEXT_PUBLIC_API_URL="${{ needs.deploy-infrastructure.outputs.load_balancer_url }}"
+          export TEST_BASE_URL="${{ needs.deploy-infrastructure.outputs.load_balancer_url }}"
+          
+          # Run critical smoke tests
+          npm run test:e2e -- --tags "@smoke" --timeout 300000
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-test-results-blue-green
+          path: frontend/test/reports/
+
+  deployment-summary:
+    runs-on: ubuntu-latest
+    needs: [build-and-test, deploy-infrastructure, run-smoke-tests]
+    if: always()
+    
+    steps:
+      - name: Create deployment summary
+        run: |
+          echo "## 🚀 Blue/Green Production Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Resource | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | **Production (Blue/Green)** |" >> $GITHUB_STEP_SUMMARY
+          echo "| Deployment Color | ${{ needs.build-and-test.outputs.deployment_color }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Application URL | ${{ needs.deploy-infrastructure.outputs.load_balancer_url }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Backend Image | ${{ needs.build-and-test.outputs.backend-image }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Frontend Image | ${{ needs.build-and-test.outputs.frontend-image }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Infrastructure Status | ${{ needs.deploy-infrastructure.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Smoke Tests Status | ${{ needs.run-smoke-tests.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Deployment Time | $(date -u) |" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ needs.deploy-infrastructure.result }}" == "success" ] && [ "${{ needs.run-smoke-tests.result }}" == "success" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "✅ **Blue/Green deployment completed successfully!**" >> $GITHUB_STEP_SUMMARY
+            echo "🎨 **Traffic switched to ${{ needs.build-and-test.outputs.deployment_color }} environment**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "❌ **Blue/Green deployment encountered issues**" >> $GITHUB_STEP_SUMMARY
+          fi

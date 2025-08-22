@@ -1,0 +1,456 @@
+name: Deploy Production Environment
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_production:
+        description: 'Type "deploy-to-production" to confirm deployment'
+        required: true
+        type: string
+      force_deploy:
+        description: 'Force deployment even if no changes detected'
+        required: false
+        default: false
+        type: boolean
+  push:
+    branches:
+      - main
+    paths:
+      - 'backend/**'
+      - 'frontend/**'
+      - 'infra/remote/environments/prod/**'
+      - '.github/workflows/deploy-prod.yml'
+
+env:
+  AWS_REGION: us-east-1
+  SAM_CLI_TELEMETRY: 0
+  ENVIRONMENT: prod
+
+# Required for OIDC authentication
+permissions:
+  id-token: write
+  contents: read
+  deployments: write
+
+jobs:
+  validate-inputs:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Validate production confirmation
+        run: |
+          if [ "${{ github.event.inputs.confirm_production }}" != "deploy-to-production" ]; then
+            echo "❌ Production deployment requires confirmation"
+            echo "Please type 'deploy-to-production' in the confirmation field"
+            exit 1
+          fi
+          echo "✅ Production deployment confirmed"
+
+  build-and-test:
+    runs-on: ubuntu-latest
+    needs: [validate-inputs]
+    if: always() && (needs.validate-inputs.result == 'success' || github.event_name == 'push')
+    outputs:
+      backend-image: ${{ steps.build.outputs.backend-image }}
+      frontend-image: ${{ steps.build.outputs.frontend-image }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: |
+            backend/package-lock.json
+            frontend/package-lock.json
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/party-collection-github-actions-role
+          role-session-name: GitHubActions-ProdBuild
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Install backend dependencies
+        run: |
+          cd backend
+          npm ci
+
+      - name: Install frontend dependencies
+        run: |
+          cd frontend
+          npm ci
+
+      - name: Run backend tests
+        run: |
+          cd backend
+          npm test
+
+      - name: Run frontend linting
+        run: |
+          cd frontend
+          npm run lint
+
+      - name: Build backend for production
+        run: |
+          cd backend
+          npm run build
+
+      - name: Build frontend for production
+        run: |
+          cd frontend
+          npm run build
+
+      - name: Build and push backend container
+        id: build-backend
+        run: |
+          cd backend
+          
+          # Create production Dockerfile
+          cat > Dockerfile << 'EOF'
+          FROM node:18-alpine AS builder
+          WORKDIR /app
+          COPY package*.json ./
+          RUN npm ci
+          COPY . .
+          RUN npm run build
+          
+          FROM node:18-alpine
+          RUN addgroup -g 1001 -S nodejs
+          RUN adduser -S nextjs -u 1001
+          WORKDIR /app
+          COPY package*.json ./
+          RUN npm ci --only=production && npm cache clean --force
+          COPY --from=builder --chown=nextjs:nodejs /app/dist ./dist
+          USER nextjs
+          EXPOSE 3001
+          CMD ["npm", "start"]
+          EOF
+          
+          # Build and push image
+          IMAGE_URI=${{ steps.login-ecr.outputs.registry }}/party-collection-backend:${{ env.ENVIRONMENT }}-${{ github.sha }}
+          LATEST_URI=${{ steps.login-ecr.outputs.registry }}/party-collection-backend:${{ env.ENVIRONMENT }}-latest
+          docker build -t $IMAGE_URI -t $LATEST_URI .
+          docker push $IMAGE_URI
+          docker push $LATEST_URI
+          echo "backend-image=$IMAGE_URI" >> $GITHUB_OUTPUT
+
+      - name: Build and push frontend container
+        id: build-frontend
+        run: |
+          cd frontend
+          
+          # Create production Dockerfile
+          cat > Dockerfile << 'EOF'
+          FROM node:18-alpine AS builder
+          WORKDIR /app
+          COPY package*.json ./
+          RUN npm ci
+          COPY . .
+          RUN npm run build
+          
+          FROM node:18-alpine
+          RUN addgroup -g 1001 -S nodejs
+          RUN adduser -S nextjs -u 1001
+          WORKDIR /app
+          COPY package*.json ./
+          RUN npm ci --only=production && npm cache clean --force
+          COPY --from=builder --chown=nextjs:nodejs /app/.next ./.next
+          COPY --from=builder --chown=nextjs:nodejs /app/public ./public
+          USER nextjs
+          EXPOSE 3000
+          CMD ["npm", "start"]
+          EOF
+          
+          # Build and push image
+          IMAGE_URI=${{ steps.login-ecr.outputs.registry }}/party-collection-frontend:${{ env.ENVIRONMENT }}-${{ github.sha }}
+          LATEST_URI=${{ steps.login-ecr.outputs.registry }}/party-collection-frontend:${{ env.ENVIRONMENT }}-latest
+          docker build -t $IMAGE_URI -t $LATEST_URI .
+          docker push $IMAGE_URI
+          docker push $LATEST_URI
+          echo "frontend-image=$IMAGE_URI" >> $GITHUB_OUTPUT
+
+      - name: Set build outputs
+        id: build
+        run: |
+          echo "backend-image=${{ steps.build-backend.outputs.backend-image }}" >> $GITHUB_OUTPUT
+          echo "frontend-image=${{ steps.build-frontend.outputs.frontend-image }}" >> $GITHUB_OUTPUT
+
+  security-scan:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/party-collection-github-actions-role
+          role-session-name: GitHubActions-SecurityScan
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Run ECR security scan
+        run: |
+          # Trigger security scans for the built images
+          aws ecr start-image-scan --repository-name party-collection-backend --image-id imageTag=${{ env.ENVIRONMENT }}-${{ github.sha }} || true
+          aws ecr start-image-scan --repository-name party-collection-frontend --image-id imageTag=${{ env.ENVIRONMENT }}-${{ github.sha }} || true
+          
+          echo "Security scans initiated. Check ECR console for results."
+
+  deploy-infrastructure:
+    runs-on: ubuntu-latest
+    needs: [build-and-test, security-scan]
+    environment: production
+    
+    steps:
+      - name: Create deployment
+        uses: actions/github-script@v7
+        id: deployment
+        with:
+          script: |
+            const deployment = await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: context.sha,
+              environment: 'production',
+              required_contexts: [],
+              auto_merge: false
+            });
+            return deployment.data.id;
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python for SAM CLI
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Setup SAM CLI
+        uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/party-collection-prod-deployment-role
+          role-session-name: GitHubActions-ProdDeploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Validate SAM template
+        run: |
+          cd infra/remote/environments/prod
+          sam validate --lint
+
+      - name: Build SAM application
+        run: |
+          cd infra/remote/environments/prod
+          sam build --cached --parallel
+
+      - name: Deploy to AWS with blue/green strategy
+        run: |
+          cd infra/remote/environments/prod
+          sam deploy \
+            --stack-name party-collection-prod \
+            --capabilities CAPABILITY_IAM \
+            --region ${{ env.AWS_REGION }} \
+            --s3-bucket party-collection-sam-state-${{ secrets.AWS_ACCOUNT_ID }} \
+            --s3-prefix prod \
+            --parameter-overrides \
+              ProjectName=party-collection \
+              Environment=prod \
+              GlobalStackName=party-collection-global \
+              BackendImage=${{ needs.build-and-test.outputs.backend-image }} \
+              FrontendImage=${{ needs.build-and-test.outputs.frontend-image }} \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset
+
+      - name: Get deployment outputs
+        id: stack-outputs
+        run: |
+          aws cloudformation describe-stacks \
+            --stack-name party-collection-prod \
+            --query 'Stacks[0].Outputs' \
+            --output json > stack-outputs.json
+          
+          APP_URL=$(jq -r '.[] | select(.OutputKey=="LoadBalancerURL") | .OutputValue' stack-outputs.json)
+          CUSTOM_URL=$(jq -r '.[] | select(.OutputKey=="CustomDomainURL") | .OutputValue' stack-outputs.json)
+          echo "app-url=$APP_URL" >> $GITHUB_OUTPUT
+          echo "custom-url=$CUSTOM_URL" >> $GITHUB_OUTPUT
+
+      - name: Wait for deployment to be healthy
+        run: |
+          echo "Waiting for application to be healthy..."
+          APP_URL="${{ steps.stack-outputs.outputs.app-url }}"
+          
+          # Wait for health check to pass
+          for i in {1..60}; do
+            if curl -sf "$APP_URL/health" > /dev/null 2>&1; then
+              echo "✅ Application is healthy!"
+              break
+            fi
+            echo "Waiting for health check... (attempt $i/60)"
+            sleep 10
+          done
+
+      - name: Update deployment status - success
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: ${{ steps.deployment.outputs.result }},
+              state: 'success',
+              environment_url: '${{ steps.stack-outputs.outputs.custom-url || steps.stack-outputs.outputs.app-url }}',
+              description: 'Production deployment successful'
+            });
+
+      - name: Update deployment status - failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: ${{ steps.deployment.outputs.result }},
+              state: 'failure',
+              description: 'Production deployment failed'
+            });
+
+  run-smoke-tests:
+    runs-on: ubuntu-latest
+    needs: [build-and-test, deploy-infrastructure]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/party-collection-github-actions-role
+          role-session-name: GitHubActions-ProdTest
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get deployment URL
+        id: get-url
+        run: |
+          APP_URL=$(aws cloudformation describe-stacks \
+            --stack-name party-collection-prod \
+            --query 'Stacks[0].Outputs[?OutputKey==`LoadBalancerURL`].OutputValue' \
+            --output text)
+          CUSTOM_URL=$(aws cloudformation describe-stacks \
+            --stack-name party-collection-prod \
+            --query 'Stacks[0].Outputs[?OutputKey==`CustomDomainURL`].OutputValue' \
+            --output text 2>/dev/null || echo "")
+          
+          if [ -n "$CUSTOM_URL" ] && [ "$CUSTOM_URL" != "null" ]; then
+            echo "app-url=$CUSTOM_URL" >> $GITHUB_OUTPUT
+          else
+            echo "app-url=$APP_URL" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Install frontend dependencies
+        run: |
+          cd frontend
+          npm ci
+
+      - name: Run smoke tests
+        run: |
+          cd frontend
+          export NEXT_PUBLIC_API_URL="${{ steps.get-url.outputs.app-url }}"
+          export TEST_BASE_URL="${{ steps.get-url.outputs.app-url }}"
+          # Run a subset of critical tests for production
+          npm run test:e2e -- --tags "@smoke"
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-test-results-prod
+          path: frontend/test/reports/
+
+  deployment-summary:
+    runs-on: ubuntu-latest
+    needs: [build-and-test, deploy-infrastructure, run-smoke-tests]
+    if: always()
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/party-collection-github-actions-role
+          role-session-name: GitHubActions-Summary
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get deployment details
+        id: deployment-info
+        run: |
+          APP_URL=$(aws cloudformation describe-stacks \
+            --stack-name party-collection-prod \
+            --query 'Stacks[0].Outputs[?OutputKey==`LoadBalancerURL`].OutputValue' \
+            --output text)
+          CUSTOM_URL=$(aws cloudformation describe-stacks \
+            --stack-name party-collection-prod \
+            --query 'Stacks[0].Outputs[?OutputKey==`CustomDomainURL`].OutputValue' \
+            --output text 2>/dev/null || echo "")
+          
+          echo "app-url=$APP_URL" >> $GITHUB_OUTPUT
+          echo "custom-url=$CUSTOM_URL" >> $GITHUB_OUTPUT
+
+      - name: Create deployment summary
+        run: |
+          echo "## 🚀 Production Environment Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Resource | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | **Production** |" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -n "${{ steps.deployment-info.outputs.custom-url }}" ] && [ "${{ steps.deployment-info.outputs.custom-url }}" != "null" ]; then
+            echo "| Application URL | ${{ steps.deployment-info.outputs.custom-url }} |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Application URL | ${{ steps.deployment-info.outputs.app-url }} |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "| Backend Image | ${{ needs.build-and-test.outputs.backend-image }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Frontend Image | ${{ needs.build-and-test.outputs.frontend-image }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Deployment Status | ${{ needs.deploy-infrastructure.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Smoke Tests Status | ${{ needs.run-smoke-tests.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Deployment Time | $(date -u) |" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ needs.deploy-infrastructure.result }}" == "success" ] && [ "${{ needs.run-smoke-tests.result }}" == "success" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "✅ **Production deployment completed successfully!**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "❌ **Production deployment encountered issues. Please review the logs.**" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Notify deployment status
+        if: always()
+        run: |
+          if [ "${{ needs.deploy-infrastructure.result }}" == "success" ] && [ "${{ needs.run-smoke-tests.result }}" == "success" ]; then
+            echo "✅ Production deployment successful"
+          else
+            echo "❌ Production deployment failed or incomplete"
+            exit 1
+          fi

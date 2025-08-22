@@ -1,0 +1,584 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Minimal Development Environment - Public Subnets Only
+  
+  Ultra-low cost development setup without NAT gateways, VPC endpoints, or 
+  expensive global infrastructure. Uses public subnets for maximum cost savings.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: party-collection
+    Description: Base name for all resources
+    
+  Environment:
+    Type: String
+    Default: dev
+    Description: Environment identifier
+    
+  # Master Environment Control
+  EnvironmentEnabled:
+    Type: String
+    Default: "true"
+    Description: Master switch to enable/disable entire environment
+    AllowedValues: ["true", "false"]
+    
+  # Scaling Configuration
+  DesiredCount:
+    Type: Number
+    Default: 0
+    Description: Number of tasks to run (0 for idle)
+    MinValue: 0
+    
+  # Database Configuration  
+  DatabaseType:
+    Type: String
+    Default: aurora-v1
+    Description: Database type for cost optimization
+    AllowedValues: [aurora-v1, rds, none]
+    
+  # Compute Configuration
+  BackendCPU:
+    Type: String
+    Default: "256"
+    Description: Backend task CPU units
+    
+  BackendMemory:
+    Type: String
+    Default: "512"
+    Description: Backend task memory (MB)
+    
+  FrontendCPU:
+    Type: String
+    Default: "256"
+    Description: Frontend task CPU units
+    
+  FrontendMemory:
+    Type: String
+    Default: "512"
+    Description: Frontend task memory (MB)
+    
+  # Cost Management
+  MonthlyBudgetLimit:
+    Type: Number
+    Default: 20
+    Description: Monthly budget limit in GBP for minimal dev environment
+    
+  AlertEmail:
+    Type: String
+    Default: admin@party-collection.local
+    Description: Email for budget alerts
+
+Conditions:
+  EnvironmentOn: !Equals [!Ref EnvironmentEnabled, "true"]
+  IsRunning: !And
+    - !Not [!Equals [!Ref DesiredCount, 0]]
+    - !Condition EnvironmentOn
+  HasDatabase: !And
+    - !Not [!Equals [!Ref DatabaseType, "none"]]
+    - !Condition EnvironmentOn
+  HasTasks: !And
+    - !Not [!Equals [!Ref DesiredCount, 0]]
+    - !Condition EnvironmentOn
+
+Resources:
+  # Minimal VPC - Public Subnets Only
+  DevVPC:
+    Type: AWS::EC2::VPC
+    Condition: EnvironmentOn
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-vpc"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Internet Gateway
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Condition: EnvironmentOn
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-igw"
+        - Key: Environment
+          Value: !Ref Environment
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Condition: EnvironmentOn
+    Properties:
+      VpcId: !Ref DevVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Public Subnets Only (No Private = No NAT Gateway Needed)
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Condition: EnvironmentOn
+    Properties:
+      VpcId: !Ref DevVPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-public-subnet-1"
+        - Key: Environment
+          Value: !Ref Environment
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Condition: EnvironmentOn
+    Properties:
+      VpcId: !Ref DevVPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-public-subnet-2"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Public Route Table
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: EnvironmentOn
+    Properties:
+      VpcId: !Ref DevVPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-public-routes"
+        - Key: Environment
+          Value: !Ref Environment
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Condition: EnvironmentOn
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: EnvironmentOn
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: EnvironmentOn
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  # CloudWatch Log Groups
+  BackendLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnvironmentOn
+    Properties:
+      LogGroupName: !Sub "/aws/ecs/${ProjectName}-${Environment}-backend"
+      RetentionInDays: 3
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  FrontendLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnvironmentOn
+    Properties:
+      LogGroupName: !Sub "/aws/ecs/${ProjectName}-${Environment}-frontend"
+      RetentionInDays: 3
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Database (Aurora Serverless v1 for auto-pause)
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Condition: HasDatabase
+    Properties:
+      DBSubnetGroupDescription: Public subnet group for dev database
+      SubnetIds:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-db-subnet-group"
+        - Key: Environment
+          Value: !Ref Environment
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: HasDatabase
+    Properties:
+      GroupDescription: Security group for database
+      VpcId: !Ref DevVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref BackendSecurityGroup
+          Description: Backend access to database
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-database-sg"
+        - Key: Environment
+          Value: !Ref Environment
+
+  DatabaseCluster:
+    Type: AWS::RDS::DBCluster
+    Condition: HasDatabase
+    Properties:
+      DBClusterIdentifier: !Sub "${ProjectName}-${Environment}-cluster"
+      Engine: aurora-postgresql
+      EngineMode: serverless
+      EngineVersion: "13.16"
+      DatabaseName: party_collection
+      MasterUsername: postgres
+      ManageMasterUserPassword: true
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref DatabaseSecurityGroup
+      DeletionProtection: false
+      BackupRetentionPeriod: 1
+      ScalingConfiguration:
+        MinCapacity: 1
+        MaxCapacity: 4
+        AutoPause: true
+        SecondsUntilAutoPause: 300  # 5 minutes
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ECS Cluster
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Condition: EnvironmentOn
+    Properties:
+      ClusterName: !Sub "${ProjectName}-${Environment}-cluster"
+      CapacityProviders:
+        - FARGATE_SPOT
+        - FARGATE
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE_SPOT
+          Weight: 80
+        - CapacityProvider: FARGATE  
+          Weight: 20
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Security Groups
+  BackendSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: EnvironmentOn
+    Properties:
+      GroupDescription: Security group for backend service
+      VpcId: !Ref DevVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3001
+          ToPort: 3001
+          CidrIp: 0.0.0.0/0
+          Description: Backend API access from internet
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-backend-sg"
+        - Key: Environment
+          Value: !Ref Environment
+
+  FrontendSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: EnvironmentOn
+    Properties:
+      GroupDescription: Security group for frontend service
+      VpcId: !Ref DevVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          CidrIp: 0.0.0.0/0
+          Description: Frontend access from internet
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-frontend-sg"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Secrets
+  JWTSecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: IsRunning
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-jwt-secret"
+      Description: JWT secret for authentication
+      GenerateSecretString:
+        SecretStringTemplate: '{}'
+        GenerateStringKey: jwt_secret
+        PasswordLength: 64
+        ExcludeCharacters: '"@/\'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ECS Task Definitions
+  BackendTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Condition: IsRunning
+    Properties:
+      Family: !Sub "${ProjectName}-${Environment}-backend"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      RuntimePlatform:
+        CpuArchitecture: ARM64
+        OperatingSystemFamily: LINUX
+      Cpu: !Ref BackendCPU
+      Memory: !Ref BackendMemory
+      ExecutionRoleArn: !Ref ECSTaskExecutionRole
+      TaskRoleArn: !Ref ECSTaskRole
+      ContainerDefinitions:
+        - Name: backend
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ProjectName}-backend:latest"
+          PortMappings:
+            - ContainerPort: 3001
+              Protocol: tcp
+          Environment:
+            - Name: NODE_ENV
+              Value: development
+            - Name: PORT
+              Value: "3001"
+            - Name: DB_HOST
+              Value: !If
+                - HasDatabase
+                - !GetAtt DatabaseCluster.Endpoint.Address
+                - "localhost"
+            - Name: FRONTEND_URL
+              Value: "http://localhost:3000"
+          Secrets: !If
+            - HasDatabase
+            - - Name: DB_PASSWORD
+                ValueFrom: !Sub "${DatabaseCluster.MasterUserSecret.SecretArn}:password::"
+              - Name: JWT_SECRET
+                ValueFrom: !Ref JWTSecret
+            - - Name: JWT_SECRET
+                ValueFrom: !Ref JWTSecret
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref BackendLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  FrontendTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Condition: IsRunning
+    Properties:
+      Family: !Sub "${ProjectName}-${Environment}-frontend"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      RuntimePlatform:
+        CpuArchitecture: ARM64
+        OperatingSystemFamily: LINUX
+      Cpu: !Ref FrontendCPU
+      Memory: !Ref FrontendMemory
+      ExecutionRoleArn: !Ref ECSTaskExecutionRole
+      TaskRoleArn: !Ref ECSTaskRole
+      ContainerDefinitions:
+        - Name: frontend
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ProjectName}-frontend:latest"
+          PortMappings:
+            - ContainerPort: 3000
+              Protocol: tcp
+          Environment:
+            - Name: NODE_ENV
+              Value: development
+            - Name: NEXT_PUBLIC_API_URL
+              Value: "http://localhost:3001"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref FrontendLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  # ECS Services (Only when DesiredCount > 0)
+  BackendService:
+    Type: AWS::ECS::Service
+    Condition: HasTasks
+    Properties:
+      ServiceName: !Sub "${ProjectName}-${Environment}-backend"
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref BackendTaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED  # Required for public subnets
+          SecurityGroups:
+            - !Ref BackendSecurityGroup
+          Subnets:
+            - !Ref PublicSubnet1
+            - !Ref PublicSubnet2
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  FrontendService:
+    Type: AWS::ECS::Service
+    Condition: HasTasks
+    Properties:
+      ServiceName: !Sub "${ProjectName}-${Environment}-frontend"
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref FrontendTaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED  # Required for public subnets
+          SecurityGroups:
+            - !Ref FrontendSecurityGroup
+          Subnets:
+            - !Ref PublicSubnet1
+            - !Ref PublicSubnet2
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Roles
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: EnvironmentOn
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: 
+                  - !If [IsRunning, !Ref JWTSecret, !Ref "AWS::NoValue"]
+                  - !If [HasDatabase, !Sub "${DatabaseCluster.MasterUserSecret.SecretArn}", !Ref "AWS::NoValue"]
+
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Condition: EnvironmentOn
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+
+  # Cost Management
+  CostAlertTopic:
+    Type: AWS::SNS::Topic
+    Condition: EnvironmentOn
+    Properties:
+      TopicName: !Sub "${ProjectName}-${Environment}-cost-alerts"
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  CostAlertSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: EnvironmentOn
+    Properties:
+      Protocol: email
+      TopicArn: !Ref CostAlertTopic
+      Endpoint: !Ref AlertEmail
+
+  EnvironmentBudget:
+    Type: AWS::Budgets::Budget
+    Condition: EnvironmentOn
+    Properties:
+      Budget:
+        BudgetName: !Sub "${ProjectName}-${Environment}-minimal-budget"
+        BudgetLimit:
+          Amount: !Ref MonthlyBudgetLimit
+          Unit: GBP
+        TimeUnit: MONTHLY
+        BudgetType: COST
+        CostFilters:
+          TagKey: ["Environment"]
+          TagValue: [!Ref Environment]
+
+Outputs:
+  EnvironmentStatus:
+    Description: Environment status and configuration
+    Value: !If
+      - EnvironmentOn
+      - !Sub |
+        Environment: ${Environment} (ENABLED)
+        Deployment Type: Minimal Dev (Public Subnets)
+        Running Tasks: ${DesiredCount}
+        Database: ${DatabaseType}
+        Budget Limit: £${MonthlyBudgetLimit}/month
+      - "Environment DISABLED"
+      
+  NetworkConfiguration:
+    Description: Network setup for minimal costs
+    Value: !If
+      - EnvironmentOn
+      - !Sub |
+        VPC: ${DevVPC} (Public subnets only)
+        No NAT Gateways: £0.00/month saved
+        No VPC Endpoints: £0.00/month saved
+        Direct internet access for all services
+      - "No network resources"
+      
+  CostOptimizations:
+    Description: Cost optimizations applied
+    Value: !Sub |
+      Public Subnets Only: Eliminates NAT Gateway costs (£45.36/month saved)
+      No Global Infrastructure: Eliminates shared costs (£61.41/month saved)
+      Aurora Serverless v1: Auto-pause capability
+      FARGATE_SPOT: 70% cost reduction on compute
+      3-day log retention: Minimal storage costs
+      
+  AccessInformation:
+    Description: How to access services when running
+    Value: !If
+      - HasTasks
+      - !Sub |
+        Backend: Tasks have public IPs (check ECS console)
+        Frontend: Tasks have public IPs (check ECS console)
+        Database: Accessible from backend tasks only
+      - "No services running (DesiredCount=0)"
+      
+  ManagementCommands:
+    Description: Quick management commands
+    Value: !Sub |
+      Scale Up: aws cloudformation update-stack --stack-name ${AWS::StackName} --use-previous-template --parameters ParameterKey=DesiredCount,ParameterValue=1
+      Scale Down: aws cloudformation update-stack --stack-name ${AWS::StackName} --use-previous-template --parameters ParameterKey=DesiredCount,ParameterValue=0
+      Disable: aws cloudformation update-stack --stack-name ${AWS::StackName} --use-previous-template --parameters ParameterKey=EnvironmentEnabled,ParameterValue=false

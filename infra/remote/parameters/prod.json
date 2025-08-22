@@ -1,0 +1,90 @@
+[
+  {
+    "ParameterKey": "ProjectName",
+    "ParameterValue": "party-collection"
+  },
+  {
+    "ParameterKey": "Environment",
+    "ParameterValue": "prod"
+  },
+  {
+    "ParameterKey": "GlobalStackName",
+    "ParameterValue": "party-collection-global"
+  },
+  {
+    "ParameterKey": "EnvironmentEnabled",
+    "ParameterValue": "true"
+  },
+  {
+    "ParameterKey": "EnableZeroScaling",
+    "ParameterValue": "false"
+  },
+  {
+    "ParameterKey": "DesiredCount",
+    "ParameterValue": "2"
+  },
+  {
+    "ParameterKey": "DatabaseType",
+    "ParameterValue": "aurora-v2"
+  },
+  {
+    "ParameterKey": "DatabaseMinCapacity",
+    "ParameterValue": "1"
+  },
+  {
+    "ParameterKey": "DatabaseMaxCapacity",
+    "ParameterValue": "16"
+  },
+  {
+    "ParameterKey": "BackendCPU",
+    "ParameterValue": "512"
+  },
+  {
+    "ParameterKey": "BackendMemory",
+    "ParameterValue": "1024"
+  },
+  {
+    "ParameterKey": "FrontendCPU",
+    "ParameterValue": "512"
+  },
+  {
+    "ParameterKey": "FrontendMemory",
+    "ParameterValue": "1024"
+  },
+  {
+    "ParameterKey": "EnableALB",
+    "ParameterValue": "true"
+  },
+  {
+    "ParameterKey": "EnableBlueGreen",
+    "ParameterValue": "true"
+  },
+  {
+    "ParameterKey": "EnableRDSProxy",
+    "ParameterValue": "true"
+  },
+  {
+    "ParameterKey": "LogRetentionDays",
+    "ParameterValue": "14"
+  },
+  {
+    "ParameterKey": "DomainName",
+    "ParameterValue": "party-collection.com"
+  },
+  {
+    "ParameterKey": "CertificateArn",
+    "ParameterValue": "arn:aws:acm:eu-west-2:ACCOUNT:certificate/CERT-ID"
+  },
+  {
+    "ParameterKey": "MonthlyBudgetLimit",
+    "ParameterValue": "250"
+  },
+  {
+    "ParameterKey": "AlertEmail",
+    "ParameterValue": "admin@party-collection.local"
+  },
+  {
+    "ParameterKey": "EnableCostManagement",
+    "ParameterValue": "true"
+  }
+]

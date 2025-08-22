@@ -1,0 +1,111 @@
+CLAUDE.md
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Production builds
+build/
+dist/
+out/
+.next/
+.vercel/
+
+# Environment files (global) - exclude examples
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# But include example files
+!.env.example
+!.env.*.example
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Runtime data and PIDs
+pids/
+*.pid
+*.seed
+*.pid.lock
+infra/local/.pids/
+.pids/
+
+# Coverage directory used by tools like istanbul
+coverage/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.settings/
+.sublime-project
+.sublime-workspace
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+
+# Test artifacts
+test-results/
+screenshots/
+videos/
+reports/
+
+# Documentation builds
+docs/_build/
+
+# Local configuration
+.config/local
+config/local.json
+
+# Cloud artifacts
+.aws-sam/
+.terraform/
+*.tfstate
+*.tfstate.backup
+
+# Security
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# PWA generated files
+frontend/public/sw.js
+frontend/public/workbox-*.js
+
+# Generated package files in scripts
+infra/local/scripts/package-lock.json
+infra/local/scripts/package.json
+
+# Next.js build artifacts
+.next/
+out/
+
+# Turbopack cache
+.turbo/
+
+# Local development artifacts
+*.local

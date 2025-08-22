@@ -1,0 +1,252 @@
+name: Cost Monitoring and Alerts
+# Documentation: docs/workflows/cost-monitoring-workflow.md
+
+on:
+  schedule:
+    - cron: '0 9 * * *'  # Daily at 9 AM UTC
+  workflow_dispatch:
+    inputs:
+      alert_threshold:
+        description: 'Alert if monthly cost exceeds (GBP)'
+        required: false
+        default: '50'
+        type: string
+
+env:
+  AWS_REGION: eu-west-2
+
+permissions:
+  id-token: write
+  contents: read
+  issues: write
+
+jobs:
+  cost-monitoring:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ secrets.AWS_ROLE_ARN_COST_MONITORING }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: Get current month costs
+      id: costs
+      run: |
+        # Get first and last day of current month
+        FIRST_DAY=$(date -d "$(date +%Y-%m-01)" +%Y-%m-%d)
+        LAST_DAY=$(date -d "$(date +%Y-%m-01) +1 month -1 day" +%Y-%m-%d)
+        
+        echo "Fetching costs from $FIRST_DAY to $LAST_DAY"
+        
+        # Get total account cost
+        TOTAL_COST=$(aws ce get-cost-and-usage \
+          --time-period Start=$FIRST_DAY,End=$LAST_DAY \
+          --granularity MONTHLY \
+          --metrics BlendedCost \
+          --query 'ResultsByTime[0].Total.BlendedCost.Amount' \
+          --output text)
+          
+        # Get cost by environment tag
+        DEV_COST=$(aws ce get-cost-and-usage \
+          --time-period Start=$FIRST_DAY,End=$LAST_DAY \
+          --granularity MONTHLY \
+          --metrics BlendedCost \
+          --group-by Type=DIMENSION,Key=LINKED_ACCOUNT \
+          --filter '{"Tags":{"Key":"Environment","Values":["dev"]}}' \
+          --query 'ResultsByTime[0].Total.BlendedCost.Amount' \
+          --output text 2>/dev/null || echo "0")
+          
+        PROD_COST=$(aws ce get-cost-and-usage \
+          --time-period Start=$FIRST_DAY,End=$LAST_DAY \
+          --granularity MONTHLY \
+          --metrics BlendedCost \
+          --group-by Type=DIMENSION,Key=LINKED_ACCOUNT \
+          --filter '{"Tags":{"Key":"Environment","Values":["prod"]}}' \
+          --query 'ResultsByTime[0].Total.BlendedCost.Amount' \
+          --output text 2>/dev/null || echo "0")
+          
+        # Get service breakdown
+        SERVICE_COSTS=$(aws ce get-cost-and-usage \
+          --time-period Start=$FIRST_DAY,End=$LAST_DAY \
+          --granularity MONTHLY \
+          --metrics BlendedCost \
+          --group-by Type=DIMENSION,Key=SERVICE \
+          --query 'ResultsByTime[0].Groups[?Total.BlendedCost.Amount!=`0`].[Keys[0],Total.BlendedCost.Amount]' \
+          --output text | head -10)
+          
+        # Convert USD to GBP (approximate)
+        USD_TO_GBP=0.79
+        TOTAL_COST_GBP=$(echo "$TOTAL_COST * $USD_TO_GBP" | bc -l | xargs printf "%.2f")
+        DEV_COST_GBP=$(echo "$DEV_COST * $USD_TO_GBP" | bc -l | xargs printf "%.2f")
+        PROD_COST_GBP=$(echo "$PROD_COST * $USD_TO_GBP" | bc -l | xargs printf "%.2f")
+        
+        echo "total_cost_usd=$TOTAL_COST" >> $GITHUB_OUTPUT
+        echo "total_cost_gbp=$TOTAL_COST_GBP" >> $GITHUB_OUTPUT
+        echo "dev_cost_gbp=$DEV_COST_GBP" >> $GITHUB_OUTPUT
+        echo "prod_cost_gbp=$PROD_COST_GBP" >> $GITHUB_OUTPUT
+        echo "service_costs<<EOF" >> $GITHUB_OUTPUT
+        echo "$SERVICE_COSTS" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+        
+    - name: Check budget thresholds
+      id: budgets
+      run: |
+        # Get budget status
+        DEV_BUDGET_STATUS=$(aws budgets describe-budget \
+          --account-id $(aws sts get-caller-identity --query Account --output text) \
+          --budget-name "party-collection-dev-minimal-budget" \
+          --query 'Budget.CalculatedSpend.ActualSpend.Amount' \
+          --output text 2>/dev/null || echo "0")
+          
+        PROD_BUDGET_STATUS=$(aws budgets describe-budget \
+          --account-id $(aws sts get-caller-identity --query Account --output text) \
+          --budget-name "party-collection-prod-budget" \
+          --query 'Budget.CalculatedSpend.ActualSpend.Amount' \
+          --output text 2>/dev/null || echo "0")
+          
+        echo "dev_budget_actual=$DEV_BUDGET_STATUS" >> $GITHUB_OUTPUT
+        echo "prod_budget_actual=$PROD_BUDGET_STATUS" >> $GITHUB_OUTPUT
+        
+        # Check if costs exceed expected ranges
+        DEV_EXPECTED=1.0  # £1 for minimal dev
+        PROD_EXPECTED=250.0  # £250 for production
+        
+        if (( $(echo "${{ steps.costs.outputs.dev_cost_gbp }} > $DEV_EXPECTED * 2" | bc -l) )); then
+          echo "dev_alert=true" >> $GITHUB_OUTPUT
+        else
+          echo "dev_alert=false" >> $GITHUB_OUTPUT
+        fi
+        
+        if (( $(echo "${{ steps.costs.outputs.prod_cost_gbp }} > $PROD_EXPECTED * 1.2" | bc -l) )); then
+          echo "prod_alert=true" >> $GITHUB_OUTPUT
+        else
+          echo "prod_alert=false" >> $GITHUB_OUTPUT
+        fi
+        
+    - name: Get resource inventory
+      id: inventory
+      run: |
+        # Count running resources
+        ECS_TASKS=$(aws ecs list-tasks --query 'length(taskArns)' --output text 2>/dev/null || echo "0")
+        RDS_INSTANCES=$(aws rds describe-db-instances --query 'length(DBInstances)' --output text 2>/dev/null || echo "0")
+        ALB_COUNT=$(aws elbv2 describe-load-balancers --query 'length(LoadBalancers)' --output text 2>/dev/null || echo "0")
+        NAT_GATEWAYS=$(aws ec2 describe-nat-gateways --query 'length(NatGateways[?State==`available`])' --output text 2>/dev/null || echo "0")
+        
+        echo "ecs_tasks=$ECS_TASKS" >> $GITHUB_OUTPUT
+        echo "rds_instances=$RDS_INSTANCES" >> $GITHUB_OUTPUT
+        echo "alb_count=$ALB_COUNT" >> $GITHUB_OUTPUT
+        echo "nat_gateways=$NAT_GATEWAYS" >> $GITHUB_OUTPUT
+        
+    - name: Create cost report issue
+      if: steps.budgets.outputs.dev_alert == 'true' || steps.budgets.outputs.prod_alert == 'true' || github.event_name == 'workflow_dispatch'
+      uses: actions/github-script@v7
+      with:
+        script: |-
+          const { 
+            total_cost_gbp, dev_cost_gbp, prod_cost_gbp, 
+            dev_alert, prod_alert,
+            ecs_tasks, rds_instances, alb_count, nat_gateways 
+          } = ${{ toJson(steps.costs.outputs) }};
+          
+          const today = new Date().toISOString().split('T')[0];
+          const title = `💰 AWS Cost Report - ${today}`;
+          
+          let alertBadge = '';
+          if (dev_alert === 'true' || prod_alert === 'true') {
+            alertBadge = '🚨 **COST ALERT** 🚨\n\n';
+          }
+          
+          const body = [
+            alertBadge + '## Monthly Cost Summary',
+            '',
+            '| Environment | Current Cost | Status |',
+            '|-------------|--------------|--------|',
+            `| **Development** | £${dev_cost_gbp} | ${dev_alert === 'true' ? '🚨 Over expected' : '✅ Normal'} |`,
+            `| **Production** | £${prod_cost_gbp} | ${prod_alert === 'true' ? '🚨 Over expected' : '✅ Normal'} |`,
+            `| **Total Account** | £${total_cost_gbp} | - |`,
+            '',
+            '## Resource Inventory',
+            '',
+            '| Resource Type | Count | Cost Impact |',
+            '|---------------|-------|-------------|',
+            `| **ECS Tasks** | ${ecs_tasks} | ${ecs_tasks > 0 ? 'Active compute costs' : 'No compute costs'} |`,
+            `| **RDS Instances** | ${rds_instances} | ${rds_instances > 0 ? 'Database costs active' : 'No database costs'} |`,
+            `| **Load Balancers** | ${alb_count} | ${alb_count > 0 ? '~£18.90/month each' : 'No ALB costs'} |`,
+            `| **NAT Gateways** | ${nat_gateways} | ${nat_gateways > 0 ? '~£22.68/month each' : 'No NAT costs'} |`,
+            '',
+            '## Cost Optimization Recommendations',
+            '',
+            dev_alert === 'true' ? '### 🚨 Development Environment Alert\n- Development costs are higher than expected\n- Consider scaling down or disabling when not in use\n- Expected: ~£1/month, Actual: £' + dev_cost_gbp + '\n' : '',
+            prod_alert === 'true' ? '### 🚨 Production Environment Alert\n- Production costs are higher than expected\n- Review resource utilization and scaling policies\n- Expected: ~£250/month, Actual: £' + prod_cost_gbp + '\n' : '',
+            '### Quick Cost Reduction Commands',
+            '',
+            '```bash',
+            '# Scale development to idle (£0.53/month)',
+            'aws cloudformation update-stack \\',
+            '  --stack-name party-collection-dev-minimal \\',
+            '  --use-previous-template \\',
+            '  --parameters ParameterKey=DesiredCount,ParameterValue=0',
+            '',
+            '# Completely disable development (£0/month)',
+            'aws cloudformation update-stack \\',
+            '  --stack-name party-collection-dev-minimal \\',
+            '  --use-previous-template \\',
+            '  --parameters ParameterKey=EnvironmentEnabled,ParameterValue=false',
+            '```',
+            '',
+            '---',
+            '*Report generated automatically by GitHub Actions*',
+            '*Next report: Tomorrow at 9 AM UTC*'
+          ].filter(line => line !== '').join('\n');
+
+          // Check for existing cost report issue today
+          const existingIssues = await github.rest.issues.listForRepo({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            labels: ['cost-report'],
+            state: 'open'
+          });
+          
+          const todayIssue = existingIssues.data.find(issue => 
+            issue.title.includes(today)
+          );
+          
+          if (todayIssue) {
+            // Update existing issue
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: todayIssue.number,
+              body: body
+            });
+          } else {
+            // Create new issue
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: title,
+              body: body,
+              labels: ['cost-report', 'monitoring']
+            });
+          }
+          
+    - name: Emergency shutdown if costs too high
+      if: steps.costs.outputs.total_cost_gbp > 500
+      run: |
+        echo "🚨 EMERGENCY: Monthly costs exceed £500"
+        echo "Triggering emergency shutdown of non-production resources"
+        
+        # Scale down development environment
+        aws cloudformation update-stack \
+          --stack-name party-collection-dev-minimal \
+          --use-previous-template \
+          --parameters ParameterKey=EnvironmentEnabled,ParameterValue=false \
+          --capabilities CAPABILITY_IAM || true
+          
+        # Send emergency notification
+        echo "Emergency shutdown triggered due to high costs: £${{ steps.costs.outputs.total_cost_gbp }}"

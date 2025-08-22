@@ -1,0 +1,25 @@
+# Process ID files and logs
+local/.pids/
+*.pid
+*.log
+
+# Node modules (if any scripts need dependencies)
+node_modules/
+
+# Environment files
+.env
+.env.local
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Temporary files
+*.tmp
+*.temp

@@ -1,0 +1,558 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Party Collection Development - Simplified without ALB
+  
+  Cost-optimized development environment with VPC endpoints, 3-day log retention,
+  and optional ALB for blue-green deployments when needed.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: party-collection
+    Description: Base name for all resources
+    
+  Environment:
+    Type: String
+    Default: dev
+    Description: Environment identifier
+    
+  GlobalStackName:
+    Type: String
+    Default: party-collection-global
+    Description: Name of the global stack for imports
+    
+  # Optional ALB Configuration
+  EnableALB:
+    Type: String
+    Default: "false"
+    Description: Enable Application Load Balancer (required for blue-green)
+    AllowedValues: ["true", "false"]
+    
+  EnableBlueGreen:
+    Type: String
+    Default: "false"
+    Description: Enable blue-green deployments (requires ALB)
+    AllowedValues: ["true", "false"]
+    
+  # Database Configuration
+  AuroraMinCapacity:
+    Type: Number
+    Default: 0.5
+    Description: Minimum Aurora Serverless v2 capacity (ACU)
+    
+  AuroraMaxCapacity:
+    Type: Number
+    Default: 2
+    Description: Maximum Aurora Serverless v2 capacity (ACU)
+    
+  # Backend Configuration
+  BackendTaskCPU:
+    Type: String
+    Default: "256"
+    Description: Backend ECS task CPU units
+    
+  BackendTaskMemory:
+    Type: String
+    Default: "512"
+    Description: Backend ECS task memory (MB)
+    
+  BackendMinCapacity:
+    Type: Number
+    Default: 1
+    Description: Minimum backend tasks
+    
+  BackendMaxCapacity:
+    Type: Number
+    Default: 4
+    Description: Maximum backend tasks
+    
+  # Frontend Configuration
+  FrontendTaskCPU:
+    Type: String
+    Default: "256"
+    Description: Frontend ECS task CPU units
+    
+  FrontendTaskMemory:
+    Type: String
+    Default: "512"
+    Description: Frontend ECS task memory (MB)
+    
+  FrontendMinCapacity:
+    Type: Number
+    Default: 1
+    Description: Minimum frontend tasks
+    
+  FrontendMaxCapacity:
+    Type: Number
+    Default: 4
+    Description: Maximum frontend tasks
+
+Conditions:
+  HasALB: !Equals [!Ref EnableALB, "true"]
+  HasBlueGreen: !And
+    - !Equals [!Ref EnableBlueGreen, "true"]
+    - !Condition HasALB
+
+Resources:
+  # CloudWatch Log Groups with 3-day retention for cost optimization
+  BackendLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/ecs/${ProjectName}-${Environment}-backend"
+      RetentionInDays: 3
+      
+  FrontendLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/ecs/${ProjectName}-${Environment}-frontend"
+      RetentionInDays: 3
+
+  # ECS Cluster
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${ProjectName}-${Environment}-cluster"
+      CapacityProviders:
+        - FARGATE_SPOT
+        - FARGATE
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE_SPOT
+          Weight: 70
+        - CapacityProvider: FARGATE  
+          Weight: 30
+
+  # Aurora Serverless Database
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for Aurora database
+      SubnetIds:
+        - Fn::ImportValue: !Sub "${GlobalStackName}-PrivateSubnet1"
+        - Fn::ImportValue: !Sub "${GlobalStackName}-PrivateSubnet2"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-db-subnet-group"
+
+  DatabaseCluster:
+    Type: AWS::RDS::DBCluster
+    Properties:
+      DBClusterIdentifier: !Sub "${ProjectName}-${Environment}-cluster"
+      Engine: aurora-postgresql
+      EngineMode: provisioned
+      EngineVersion: "15.4"
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: !Ref AuroraMinCapacity
+        MaxCapacity: !Ref AuroraMaxCapacity
+      DatabaseName: party_collection
+      MasterUsername: postgres
+      ManageMasterUserPassword: true
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref DatabaseSecurityGroup
+      DeletionProtection: false
+      BackupRetentionPeriod: 1
+      PreferredBackupWindow: "03:00-04:00"
+      PreferredMaintenanceWindow: "sun:04:00-sun:05:00"
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  DatabaseInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub "${ProjectName}-${Environment}-writer"
+      DBClusterIdentifier: !Ref DatabaseCluster
+      DBInstanceClass: db.serverless
+      Engine: aurora-postgresql
+
+  # Database Security Group
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Aurora database
+      VpcId:
+        Fn::ImportValue: !Sub "${GlobalStackName}-VPC"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref BackendSecurityGroup
+          Description: Backend access to database
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-database-sg"
+
+  # Backend Security Group  
+  BackendSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for backend service
+      VpcId:
+        Fn::ImportValue: !Sub "${GlobalStackName}-VPC"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3001
+          ToPort: 3001
+          CidrIp: 10.0.0.0/16
+          Description: Backend API access from VPC
+        - !If
+          - HasALB
+          - IpProtocol: tcp
+            FromPort: 3001
+            ToPort: 3001
+            SourceSecurityGroupId: !Ref ALBSecurityGroup
+            Description: ALB access to backend
+          - !Ref AWS::NoValue
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-backend-sg"
+
+  # Frontend Security Group
+  FrontendSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for frontend service
+      VpcId:
+        Fn::ImportValue: !Sub "${GlobalStackName}-VPC"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          CidrIp: 10.0.0.0/16
+          Description: Frontend access from VPC
+        - !If
+          - HasALB
+          - IpProtocol: tcp
+            FromPort: 3000
+            ToPort: 3000
+            SourceSecurityGroupId: !Ref ALBSecurityGroup
+            Description: ALB access to frontend
+          - !Ref AWS::NoValue
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-frontend-sg"
+
+  # Application Load Balancer (Conditional)
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: HasALB
+    Properties:
+      GroupDescription: Security group for Application Load Balancer
+      VpcId:
+        Fn::ImportValue: !Sub "${GlobalStackName}-VPC"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP access from internet
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS access from internet
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-alb-sg"
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Condition: HasALB
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-alb"
+      Type: application
+      IpAddressType: ipv4
+      Scheme: internet-facing
+      Subnets:
+        - Fn::ImportValue: !Sub "${GlobalStackName}-PublicSubnet1"
+        - Fn::ImportValue: !Sub "${GlobalStackName}-PublicSubnet2"
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Target Groups for Blue/Green (Conditional)
+  BackendTargetGroupBlue:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: HasBlueGreen
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-backend-blue"
+      Port: 3001
+      Protocol: HTTP
+      VpcId:
+        Fn::ImportValue: !Sub "${GlobalStackName}-VPC"
+      TargetType: ip
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+
+  BackendTargetGroupGreen:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: HasBlueGreen
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-backend-green"
+      Port: 3001
+      Protocol: HTTP
+      VpcId:
+        Fn::ImportValue: !Sub "${GlobalStackName}-VPC"
+      TargetType: ip
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+
+  # Simple Target Group (when ALB enabled but not blue-green)
+  BackendTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: HasALB
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-backend"
+      Port: 3001
+      Protocol: HTTP
+      VpcId:
+        Fn::ImportValue: !Sub "${GlobalStackName}-VPC"
+      TargetType: ip
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+
+  # ALB Listener
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasALB
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !If
+            - HasBlueGreen
+            - !Ref BackendTargetGroupBlue
+            - !Ref BackendTargetGroup
+
+  # ECS Task Definitions
+  BackendTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${ProjectName}-${Environment}-backend"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !Ref BackendTaskCPU
+      Memory: !Ref BackendTaskMemory
+      ExecutionRoleArn: !Ref ECSTaskExecutionRole
+      TaskRoleArn: !Ref ECSTaskRole
+      ContainerDefinitions:
+        - Name: backend
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ProjectName}-backend:latest"
+          PortMappings:
+            - ContainerPort: 3001
+              Protocol: tcp
+          Environment:
+            - Name: NODE_ENV
+              Value: development
+            - Name: PORT
+              Value: "3001"
+            - Name: DB_HOST
+              Value: !GetAtt DatabaseCluster.Endpoint.Address
+            - Name: DB_PORT
+              Value: "5432"
+            - Name: DB_NAME
+              Value: party_collection
+            - Name: FRONTEND_URL
+              Value: !If
+                - HasALB
+                - !Sub "http://${ApplicationLoadBalancer.DNSName}"
+                - "http://localhost:3000"
+          Secrets:
+            - Name: DB_PASSWORD
+              ValueFrom: !Sub "${DatabaseCluster.MasterUserSecret.SecretArn}:password::"
+            - Name: JWT_SECRET
+              ValueFrom: !Ref JWTSecret
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref BackendLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  FrontendTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${ProjectName}-${Environment}-frontend"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !Ref FrontendTaskCPU
+      Memory: !Ref FrontendTaskMemory
+      ExecutionRoleArn: !Ref ECSTaskExecutionRole
+      TaskRoleArn: !Ref ECSTaskRole
+      ContainerDefinitions:
+        - Name: frontend
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ProjectName}-frontend:latest"
+          PortMappings:
+            - ContainerPort: 3000
+              Protocol: tcp
+          Environment:
+            - Name: NODE_ENV
+              Value: development
+            - Name: NEXT_PUBLIC_API_URL
+              Value: !If
+                - HasALB
+                - !Sub "http://${ApplicationLoadBalancer.DNSName}"
+                - "http://localhost:3001"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref FrontendLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  # ECS Services
+  BackendService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub "${ProjectName}-${Environment}-backend"
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref BackendTaskDefinition
+      DesiredCount: !Ref BackendMinCapacity
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - !Ref BackendSecurityGroup
+          Subnets:
+            - Fn::ImportValue: !Sub "${GlobalStackName}-PrivateSubnet1"
+            - Fn::ImportValue: !Sub "${GlobalStackName}-PrivateSubnet2"
+      LoadBalancers: !If
+        - HasALB
+        - - TargetGroupArn: !If
+              - HasBlueGreen
+              - !Ref BackendTargetGroupBlue
+              - !Ref BackendTargetGroup
+            ContainerName: backend
+            ContainerPort: 3001
+        - []
+
+  FrontendService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub "${ProjectName}-${Environment}-frontend"
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref FrontendTaskDefinition
+      DesiredCount: !Ref FrontendMinCapacity
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - !Ref FrontendSecurityGroup
+          Subnets:
+            - Fn::ImportValue: !Sub "${GlobalStackName}-PrivateSubnet1"
+            - Fn::ImportValue: !Sub "${GlobalStackName}-PrivateSubnet2"
+
+  # Secrets
+  JWTSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-jwt-secret"
+      Description: JWT secret for authentication
+      GenerateSecretString:
+        SecretStringTemplate: '{}'
+        GenerateStringKey: jwt_secret
+        PasswordLength: 64
+        ExcludeCharacters: '"@/\'
+
+  # IAM Roles
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref JWTSecret
+                  - !Sub "${DatabaseCluster.MasterUserSecret.SecretArn}"
+
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !GetAtt BackendLogGroup.Arn
+                  - !GetAtt FrontendLogGroup.Arn
+
+Outputs:
+  ClusterName:
+    Description: Name of the ECS cluster
+    Value: !Ref ECSCluster
+    
+  DatabaseEndpoint:
+    Description: Aurora database endpoint
+    Value: !GetAtt DatabaseCluster.Endpoint.Address
+    
+  ALBEndpoint:
+    Description: Application Load Balancer endpoint (if enabled)
+    Value: !If
+      - HasALB
+      - !GetAtt ApplicationLoadBalancer.DNSName
+      - "ALB not enabled"
+    
+  BackendServiceName:
+    Description: Backend ECS service name
+    Value: !Ref BackendService
+    
+  FrontendServiceName:
+    Description: Frontend ECS service name
+    Value: !Ref FrontendService
+
+  # Cost Optimization Summary
+  CostOptimizations:
+    Description: Applied cost optimizations
+    Value: !Sub |
+      - VPC Endpoints: Eliminates NAT Gateway costs (${EnableALB} ALB mode)
+      - 3-day log retention: Reduces CloudWatch costs by ~85%
+      - FARGATE_SPOT: Up to 70% savings on compute
+      - Aurora Serverless v2: Scales to 0.5 ACU minimum
+      - Optional ALB: Only when blue-green deployments needed

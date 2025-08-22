@@ -1,0 +1,387 @@
+name: Deploy Development Environment
+# Documentation: docs/workflows/dev-deployment-workflow.md
+
+on:
+  push:
+    branches: [develop, 'feature/*']
+    paths:
+      - 'backend/**'
+      - 'frontend/**'
+      - 'infra/remote/templates/minimal-dev-template.yaml'
+      - 'infra/remote/parameters/dev-minimal.json'
+  pull_request:
+    branches: [develop]
+    paths:
+      - 'backend/**'
+      - 'frontend/**'
+      - 'infra/remote/templates/minimal-dev-template.yaml'
+      - 'infra/remote/parameters/dev-minimal.json'
+  workflow_dispatch:
+    inputs:
+      desired_count:
+        description: 'Number of tasks to run (0 for idle)'
+        required: false
+        default: '0'
+        type: string
+      environment_enabled:
+        description: 'Enable environment (true/false)'
+        required: false
+        default: 'true'
+        type: string
+
+env:
+  AWS_REGION: eu-west-2
+  STACK_NAME: party-collection-dev-minimal
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  test-local:
+    runs-on: ubuntu-latest
+    name: Run Comprehensive Tests Before Deployment
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+        cache-dependency-path: |
+          backend/package-lock.json
+          frontend/package-lock.json
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: Start Local Environment
+      run: |
+        echo "🚀 Starting local development environment for testing..."
+        cd infra/local/scripts
+        chmod +x *.sh
+        ./start-local.sh
+        
+    - name: Wait for Services
+      run: |
+        echo "⏳ Waiting for services to be ready..."
+        timeout 120 bash -c 'until curl -s http://localhost:3001/health; do sleep 2; done'
+        timeout 120 bash -c 'until curl -s http://localhost:3000; do sleep 2; done'
+        echo "✅ Services are ready"
+        
+    - name: Run Backend Tests
+      run: |
+        echo "🧪 Running backend API tests..."
+        cd backend
+        npm ci
+        npm test
+        
+    - name: Run Comprehensive E2E Tests  
+      run: |
+        echo "🧪 Running comprehensive frontend E2E tests..."
+        cd frontend
+        npm ci
+        # Use the multi-environment test runner for consistency
+        node ../test-runner.js --env=local
+        
+    - name: Stop Local Environment
+      if: always()
+      run: |
+        echo "🛑 Cleaning up local environment..."
+        cd infra/local/scripts
+        ./stop-local.sh --clean || true
+
+  deploy-dev:
+    runs-on: ubuntu-latest
+    environment: development
+    needs: test-local
+    if: success()
+    
+    outputs:
+      deployment_active: ${{ steps.status.outputs.deployment_active }}
+      backend_ip: ${{ steps.status.outputs.backend_ip }}
+      frontend_ip: ${{ steps.status.outputs.frontend_ip }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ secrets.AWS_ROLE_ARN_DEV }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: Set deployment parameters
+      id: params
+      run: |
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          echo "desired_count=${{ github.event.inputs.desired_count }}" >> $GITHUB_OUTPUT
+          echo "environment_enabled=${{ github.event.inputs.environment_enabled }}" >> $GITHUB_OUTPUT
+        else
+          # Default to scale-to-zero for all branches (maximum cost efficiency)
+          echo "desired_count=0" >> $GITHUB_OUTPUT
+          echo "environment_enabled=true" >> $GITHUB_OUTPUT
+        fi
+        
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        
+    - name: Build Backend
+      run: |
+        cd backend
+        npm ci
+        npm run build
+        npm test
+        
+    - name: Build Frontend
+      run: |
+        cd frontend
+        npm ci
+        npm run build
+        npm run lint
+        
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+      
+    - name: Create ECR repositories if they don't exist
+      run: |
+        aws ecr describe-repositories --repository-names party-collection-backend || \
+          aws ecr create-repository --repository-name party-collection-backend
+        aws ecr describe-repositories --repository-names party-collection-frontend || \
+          aws ecr create-repository --repository-name party-collection-frontend
+          
+    - name: Set up Docker Buildx for ARM64
+      uses: docker/setup-buildx-action@v3
+        
+    - name: Build and push Backend Docker image (ARM64)
+      run: |
+        cd backend
+        docker buildx build --platform linux/arm64 \
+          -t ${{ steps.login-ecr.outputs.registry }}/party-collection-backend:${{ github.sha }} \
+          -t ${{ steps.login-ecr.outputs.registry }}/party-collection-backend:latest \
+          --push .
+        
+    - name: Build and push Frontend Docker image (ARM64)
+      run: |
+        cd frontend
+        docker buildx build --platform linux/arm64 \
+          -t ${{ steps.login-ecr.outputs.registry }}/party-collection-frontend:${{ github.sha }} \
+          -t ${{ steps.login-ecr.outputs.registry }}/party-collection-frontend:latest \
+          --push .
+        
+    - name: Deploy Infrastructure
+      run: |
+        cd infra/remote
+        aws cloudformation deploy \
+          --template-file templates/minimal-dev-template.yaml \
+          --stack-name ${{ env.STACK_NAME }} \
+          --parameter-overrides \
+            ParameterKey=DesiredCount,ParameterValue=${{ steps.params.outputs.desired_count }} \
+            ParameterKey=EnvironmentEnabled,ParameterValue=${{ steps.params.outputs.environment_enabled }} \
+            ParameterKey=AlertEmail,ParameterValue=${{ secrets.ALERT_EMAIL }} \
+            file://parameters/dev-minimal.json \
+          --capabilities CAPABILITY_IAM \
+          --no-fail-on-empty-changeset
+          
+    - name: Get deployment status
+      id: status
+      run: |
+        if [ "${{ steps.params.outputs.environment_enabled }}" = "true" ] && [ "${{ steps.params.outputs.desired_count }}" != "0" ]; then
+          echo "deployment_active=true" >> $GITHUB_OUTPUT
+          # Get task public IPs
+          CLUSTER_NAME="party-collection-dev-cluster"
+          BACKEND_SERVICE="party-collection-dev-backend"
+          FRONTEND_SERVICE="party-collection-dev-frontend"
+          
+          echo "Getting task IPs..."
+          BACKEND_IP=$(aws ecs describe-tasks \
+            --cluster $CLUSTER_NAME \
+            --tasks $(aws ecs list-tasks --cluster $CLUSTER_NAME --service-name $BACKEND_SERVICE --query 'taskArns[0]' --output text) \
+            --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value' --output text | \
+            xargs -I {} aws ec2 describe-network-interfaces --network-interface-ids {} --query 'NetworkInterfaces[0].Association.PublicIp' --output text)
+            
+          FRONTEND_IP=$(aws ecs describe-tasks \
+            --cluster $CLUSTER_NAME \
+            --tasks $(aws ecs list-tasks --cluster $CLUSTER_NAME --service-name $FRONTEND_SERVICE --query 'taskArns[0]' --output text) \
+            --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value' --output text | \
+            xargs -I {} aws ec2 describe-network-interfaces --network-interface-ids {} --query 'NetworkInterfaces[0].Association.PublicIp' --output text)
+            
+          echo "backend_ip=$BACKEND_IP" >> $GITHUB_OUTPUT
+          echo "frontend_ip=$FRONTEND_IP" >> $GITHUB_OUTPUT
+        else
+          echo "deployment_active=false" >> $GITHUB_OUTPUT
+        fi
+        
+    - name: Run health checks
+      if: steps.status.outputs.deployment_active == 'true'
+      run: |
+        echo "Waiting for services to be healthy..."
+        sleep 60
+        
+        # Check backend health
+        if [ "${{ steps.status.outputs.backend_ip }}" != "None" ]; then
+          curl -f http://${{ steps.status.outputs.backend_ip }}:3001/health || exit 1
+        fi
+        
+        # Check frontend accessibility
+        if [ "${{ steps.status.outputs.frontend_ip }}" != "None" ]; then
+          curl -f http://${{ steps.status.outputs.frontend_ip }}:3000 || exit 1
+        fi
+        
+    - name: Cleanup on failure
+      if: failure() && github.ref_name != 'develop'
+      run: |
+        # For feature branches, clean up on failure
+        echo "Cleaning up failed deployment..."
+        aws cloudformation update-stack \
+          --stack-name ${{ env.STACK_NAME }} \
+          --use-previous-template \
+          --parameters ParameterKey=EnvironmentEnabled,ParameterValue=false \
+          --capabilities CAPABILITY_IAM || true
+          
+    - name: Comment on PR
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const { deployment_active, backend_ip, frontend_ip } = ${{ toJson(steps.status.outputs) }};
+          
+          let comment = `## 🚀 Development Environment Deployed\n\n`;
+          comment += `**Branch**: \`${{ github.ref_name }}\`\n`;
+          comment += `**Commit**: \`${{ github.sha }}\`\n\n`;
+          
+          if (deployment_active === 'true') {
+            comment += `### 🌐 Access URLs\n`;
+            if (backend_ip && backend_ip !== 'None') {
+              comment += `- **Backend API**: http://${backend_ip}:3001\n`;
+              comment += `- **Health Check**: http://${backend_ip}:3001/health\n`;
+            }
+            if (frontend_ip && frontend_ip !== 'None') {
+              comment += `- **Frontend**: http://${frontend_ip}:3000\n`;
+            }
+            comment += `\n### 💰 Current Cost\n`;
+            comment += `- **Monthly**: £19.18 (active development)\n`;
+            comment += `- **Will auto-scale to**: £0.53/month when idle\n`;
+            comment += `- **[Cost Optimization Guide](docs/deployment/cost-guide.md)** - Detailed cost analysis\n`;
+          } else {
+            comment += `### 💤 Environment Status\n`;
+            comment += `Environment deployed but scaled to zero (idle state) for maximum cost efficiency.\n`;
+            comment += `**Cost**: £0.53/month\n`;
+            comment += `**[Cost Guide](docs/deployment/cost-guide.md)** - Optimization strategies\n\n`;
+            comment += `**To activate for development:**\n`;
+            comment += `- Use GitHub Actions > Deploy Development Environment > Run workflow\n`;
+            comment += `- Set DesiredCount=1, EnvironmentEnabled=true\n`;
+          }
+          
+          comment += `\n### 🔧 Management\n`;
+          comment += `- **Scale up**: \`aws cloudformation update-stack --stack-name ${{ env.STACK_NAME }} --use-previous-template --parameters ParameterKey=DesiredCount,ParameterValue=1\`\n`;
+          comment += `- **Scale down**: \`aws cloudformation update-stack --stack-name ${{ env.STACK_NAME }} --use-previous-template --parameters ParameterKey=DesiredCount,ParameterValue=0\`\n`;
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: comment
+          });
+          
+  test-deployed:
+    runs-on: ubuntu-latest
+    name: Test Deployed Environment
+    needs: deploy-dev
+    if: success() && needs.deploy-dev.outputs.deployment_active == 'true'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+        cache-dependency-path: frontend/package-lock.json
+        
+    - name: Install frontend dependencies
+      run: |
+        cd frontend
+        npm ci
+        
+    - name: Wait for deployment to be fully ready
+      run: |
+        echo "⏳ Waiting for deployed services to be fully ready..."
+        backend_ip="${{ needs.deploy-dev.outputs.backend_ip }}"
+        frontend_ip="${{ needs.deploy-dev.outputs.frontend_ip }}"
+        
+        if [ "$backend_ip" != "None" ]; then
+          echo "Testing backend at http://$backend_ip:3001"
+          timeout 300 bash -c "until curl -s http://$backend_ip:3001/health; do echo 'Waiting for backend...'; sleep 10; done"
+          echo "✅ Backend is ready"
+        fi
+        
+        if [ "$frontend_ip" != "None" ]; then
+          echo "Testing frontend at http://$frontend_ip:3000"
+          timeout 300 bash -c "until curl -s http://$frontend_ip:3000; do echo 'Waiting for frontend...'; sleep 10; done"
+          echo "✅ Frontend is ready"
+        fi
+        
+    - name: Test Against Live Deployment
+      env:
+        DEV_API_URL: "http://${{ needs.deploy-dev.outputs.backend_ip }}:3001"
+        NEXT_PUBLIC_API_URL: "http://${{ needs.deploy-dev.outputs.backend_ip }}:3001"
+      run: |
+        echo "🧪 Running tests against live deployed environment..."
+        echo "Backend API: $DEV_API_URL"
+        echo "Frontend: http://${{ needs.deploy-dev.outputs.frontend_ip }}:3000"
+        
+        # Run tests against the deployed environment
+        node test-runner.js --env=dev
+        
+    - name: Comment Test Results
+      if: always()
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const testResult = process.env.TEST_EXIT_CODE === '0' ? '✅ PASSED' : '❌ FAILED';
+          const comment = `## 🧪 Post-Deployment Test Results
+          
+          **Tests against live environment**: ${testResult}
+          
+          **Tested URLs:**
+          - Backend API: http://${{ needs.deploy-dev.outputs.backend_ip }}:3001
+          - Frontend: http://${{ needs.deploy-dev.outputs.frontend_ip }}:3000
+          
+          ${testResult === '❌ FAILED' ? '⚠️ **Action Required**: Tests failed against the deployed environment. Please investigate.' : '🎉 All tests passed against the live deployment!'}`;
+          
+          if (context.payload.pull_request) {
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+          }
+
+  cleanup-old-branches:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref_name, 'feature/')
+    needs: [deploy-dev, test-deployed]
+    
+    steps:
+    - name: Configure AWS credentials  
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ secrets.AWS_ROLE_ARN_DEV }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: Cleanup merged feature branches
+      run: |
+        # This job cleans up stacks for merged/deleted feature branches
+        # Implementation would check for stacks with non-existent branches
+        echo "Feature branch cleanup logic would go here"

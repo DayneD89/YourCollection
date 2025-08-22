@@ -1,0 +1,20 @@
+{
+  "ProjectName": "party-collection",
+  "Environment": "dev",
+  "GlobalStackName": "party-collection-global",
+  "DomainName": "",
+  "DBInstanceClass": "db.t4g.micro",
+  "EnableRDSProxy": "true",
+  "BackendTaskCPU": "256",
+  "BackendTaskMemory": "512",
+  "BackendMinCapacity": 0,
+  "BackendMaxCapacity": 3,
+  "BackendTargetCPU": 70,
+  "FrontendTaskCPU": "256", 
+  "FrontendTaskMemory": "512",
+  "FrontendMinCapacity": 0,
+  "FrontendMaxCapacity": 3,
+  "FrontendTargetCPU": 70,
+  "BackendImage": "nginx:latest",
+  "FrontendImage": "nginx:latest"
+}

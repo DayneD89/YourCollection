@@ -1,0 +1,378 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Database Substack - Multi-Type with True Zero Scaling
+  
+  Supports Aurora Serverless v1 (pausable), Aurora v2, RDS, or no database.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Description: Base name for all resources
+    
+  Environment:
+    Type: String
+    Description: Environment identifier
+    
+  GlobalStackName:
+    Type: String
+    Description: Name of the global stack for imports
+    
+  DatabaseType:
+    Type: String
+    Default: aurora-v1
+    Description: Database type for cost optimization
+    AllowedValues: [aurora-v1, aurora-v2, rds, none]
+    
+  MinCapacity:
+    Type: Number
+    Default: 1
+    Description: Minimum database capacity
+    
+  MaxCapacity:
+    Type: Number
+    Default: 8
+    Description: Maximum database capacity
+    
+  EnableRDSProxy:
+    Type: String
+    Default: "false"
+    Description: Enable RDS Proxy for connection pooling
+    AllowedValues: ["true", "false"]
+    
+  EnableZeroScaling:
+    Type: String
+    Default: "true"
+    Description: Enable auto-pause/stop for zero costs
+    AllowedValues: ["true", "false"]
+
+Conditions:
+  IsAuroraV1: !Equals [!Ref DatabaseType, "aurora-v1"]
+  IsAuroraV2: !Equals [!Ref DatabaseType, "aurora-v2"]
+  IsRDS: !Equals [!Ref DatabaseType, "rds"]
+  HasDatabase: !Not [!Equals [!Ref DatabaseType, "none"]]
+  IsAurora: !Or [!Condition IsAuroraV1, !Condition IsAuroraV2]
+  EnableProxy: !And
+    - !Equals [!Ref EnableRDSProxy, "true"]
+    - !Condition HasDatabase
+  CanPause: !And
+    - !Equals [!Ref EnableZeroScaling, "true"]
+    - !Or [!Condition IsAuroraV1, !Condition IsRDS]
+
+Resources:
+  # Database Subnet Group
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Condition: HasDatabase
+    Properties:
+      DBSubnetGroupDescription: Subnet group for database
+      SubnetIds:
+        - Fn::ImportValue: !Sub "${GlobalStackName}-PrivateSubnet1"
+        - Fn::ImportValue: !Sub "${GlobalStackName}-PrivateSubnet2"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-db-subnet-group"
+
+  # Database Security Group
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: HasDatabase
+    Properties:
+      GroupDescription: Security group for database
+      VpcId:
+        Fn::ImportValue: !Sub "${GlobalStackName}-VPC"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: 10.0.0.0/16
+          Description: PostgreSQL access from VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-database-sg"
+
+  # Aurora Serverless v1 Cluster (Can Pause to £0)
+  AuroraV1Cluster:
+    Type: AWS::RDS::DBCluster
+    Condition: IsAuroraV1
+    Properties:
+      DBClusterIdentifier: !Sub "${ProjectName}-${Environment}-aurora-v1"
+      Engine: aurora-postgresql
+      EngineMode: serverless
+      EngineVersion: "13.7"
+      DatabaseName: party_collection
+      MasterUsername: postgres
+      ManageMasterUserPassword: true
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref DatabaseSecurityGroup
+      DeletionProtection: false
+      BackupRetentionPeriod: !If [!Equals [!Ref Environment, "prod"], 7, 1]
+      ScalingConfiguration:
+        MinCapacity: !Ref MinCapacity
+        MaxCapacity: !Ref MaxCapacity
+        AutoPause: !If [!Condition CanPause, true, false]
+        SecondsUntilAutoPause: !If [!Condition CanPause, 300, !Ref AWS::NoValue]  # 5 minutes
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: AutoPause
+          Value: !If [!Condition CanPause, "enabled", "disabled"]
+
+  # Aurora Serverless v2 Cluster (Minimum 0.5 ACU)
+  AuroraV2Cluster:
+    Type: AWS::RDS::DBCluster
+    Condition: IsAuroraV2
+    Properties:
+      DBClusterIdentifier: !Sub "${ProjectName}-${Environment}-aurora-v2"
+      Engine: aurora-postgresql
+      EngineMode: provisioned
+      EngineVersion: "15.4"
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: 0.5  # AWS minimum
+        MaxCapacity: !Ref MaxCapacity
+      DatabaseName: party_collection
+      MasterUsername: postgres
+      ManageMasterUserPassword: true
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref DatabaseSecurityGroup
+      DeletionProtection: false
+      BackupRetentionPeriod: !If [!Equals [!Ref Environment, "prod"], 7, 1]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  AuroraV2Instance:
+    Type: AWS::RDS::DBInstance
+    Condition: IsAuroraV2
+    Properties:
+      DBInstanceIdentifier: !Sub "${ProjectName}-${Environment}-aurora-v2-writer"
+      DBClusterIdentifier: !Ref AuroraV2Cluster
+      DBInstanceClass: db.serverless
+      Engine: aurora-postgresql
+
+  # RDS Instance (Can Stop to £0 compute, £1.64/month storage)
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    Condition: IsRDS
+    Properties:
+      DBInstanceIdentifier: !Sub "${ProjectName}-${Environment}-rds"
+      DBInstanceClass: db.t4g.micro
+      Engine: postgres
+      EngineVersion: "15.4"
+      AllocatedStorage: 20
+      StorageType: gp3
+      DatabaseName: party_collection
+      MasterUsername: postgres
+      ManageMasterUserPassword: true
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref DatabaseSecurityGroup
+      DeletionProtection: false
+      BackupRetentionPeriod: 0  # No backups for cost optimization
+      MultiAZ: false
+      PubliclyAccessible: false
+      AutoMinorVersionUpgrade: true
+      DeletionPolicy: Delete
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: AutoStop
+          Value: !If [!Condition CanPause, "enabled", "disabled"]
+
+  # RDS Proxy (Optional for connection pooling)
+  RDSProxy:
+    Type: AWS::RDS::DBProxy
+    Condition: EnableProxy
+    Properties:
+      DBProxyName: !Sub "${ProjectName}-${Environment}-proxy"
+      EngineFamily: POSTGRESQL
+      RequireTLS: false
+      RoleArn: !GetAtt RDSProxyRole.Arn
+      VpcSubnetIds:
+        - Fn::ImportValue: !Sub "${GlobalStackName}-PrivateSubnet1"
+        - Fn::ImportValue: !Sub "${GlobalStackName}-PrivateSubnet2"
+      VpcSecurityGroupIds:
+        - !Ref DatabaseSecurityGroup
+      Auth:
+        - AuthScheme: SECRETS
+          SecretArn: !If
+            - IsAuroraV1
+            - !GetAtt AuroraV1Cluster.MasterUserSecret.SecretArn
+            - !If
+              - IsAuroraV2
+              - !GetAtt AuroraV2Cluster.MasterUserSecret.SecretArn
+              - !GetAtt RDSInstance.MasterUserSecret.SecretArn
+      TargetGroups:
+        - DBClusterIdentifiers: !If
+            - IsAurora
+            - !If
+              - IsAuroraV1
+              - [!Ref AuroraV1Cluster]
+              - [!Ref AuroraV2Cluster]
+            - !Ref AWS::NoValue
+          DBInstanceIdentifiers: !If
+            - IsRDS
+            - [!Ref RDSInstance]
+            - !Ref AWS::NoValue
+
+  # Database Auto-Stop Lambda (for RDS)
+  DatabaseStopFunction:
+    Type: AWS::Serverless::Function
+    Condition: CanPause
+    Properties:
+      FunctionName: !Sub "${ProjectName}-${Environment}-db-auto-stop"
+      CodeUri: |
+        import boto3
+        import json
+        import os
+        
+        def lambda_handler(event, context):
+            rds = boto3.client('rds')
+            db_instance_id = os.environ['DB_INSTANCE_ID']
+            db_type = os.environ['DB_TYPE']
+            
+            try:
+                if db_type == 'rds':
+                    # Stop RDS instance
+                    rds.stop_db_instance(DBInstanceIdentifier=db_instance_id)
+                    return {'statusCode': 200, 'body': f'RDS {db_instance_id} stopped'}
+                elif db_type == 'aurora-v1':
+                    # Aurora v1 auto-pauses, no action needed
+                    return {'statusCode': 200, 'body': 'Aurora v1 auto-pause enabled'}
+                else:
+                    return {'statusCode': 200, 'body': 'No stop action for this database type'}
+            except Exception as e:
+                return {'statusCode': 500, 'body': f'Error: {str(e)}'}
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Environment:
+        Variables:
+          DB_INSTANCE_ID: !If
+            - IsRDS
+            - !Ref RDSInstance
+            - !If
+              - IsAuroraV1
+              - !Ref AuroraV1Cluster
+              - !Ref AuroraV2Cluster
+          DB_TYPE: !Ref DatabaseType
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - rds:StopDBInstance
+                - rds:StartDBInstance
+                - rds:DescribeDBInstances
+                - rds:DescribeDBClusters
+              Resource: '*'
+
+  # Scheduled auto-stop (weekends and after hours)
+  DatabaseStopSchedule:
+    Type: AWS::Events::Rule
+    Condition: CanPause
+    Properties:
+      Description: Stop database during idle hours
+      ScheduleExpression: "cron(0 23 ? * MON-FRI *)"  # 11 PM weekdays
+      Targets:
+        - Arn: !GetAtt DatabaseStopFunction.Arn
+          Id: DatabaseStopTarget
+
+  DatabaseStopPermission:
+    Type: AWS::Lambda::Permission
+    Condition: CanPause
+    Properties:
+      FunctionName: !Ref DatabaseStopFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DatabaseStopSchedule.Arn
+
+  # IAM Role for RDS Proxy
+  RDSProxyRole:
+    Type: AWS::IAM::Role
+    Condition: EnableProxy
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: rds.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource: !If
+                  - IsAuroraV1
+                  - !GetAtt AuroraV1Cluster.MasterUserSecret.SecretArn
+                  - !If
+                    - IsAuroraV2
+                    - !GetAtt AuroraV2Cluster.MasterUserSecret.SecretArn
+                    - !GetAtt RDSInstance.MasterUserSecret.SecretArn
+
+Outputs:
+  DatabaseEndpoint:
+    Description: Database connection endpoint
+    Value: !If
+      - EnableProxy
+      - !GetAtt RDSProxy.Endpoint
+      - !If
+        - IsAuroraV1
+        - !GetAtt AuroraV1Cluster.Endpoint.Address
+        - !If
+          - IsAuroraV2
+          - !GetAtt AuroraV2Cluster.Endpoint.Address
+          - !If
+            - IsRDS
+            - !GetAtt RDSInstance.Endpoint.Address
+            - "No database"
+            
+  DatabaseSecretArn:
+    Description: Database master user secret ARN
+    Value: !If
+      - IsAuroraV1
+      - !GetAtt AuroraV1Cluster.MasterUserSecret.SecretArn
+      - !If
+        - IsAuroraV2
+        - !GetAtt AuroraV2Cluster.MasterUserSecret.SecretArn
+        - !If
+          - IsRDS
+          - !GetAtt RDSInstance.MasterUserSecret.SecretArn
+          - ""
+          
+  DatabaseType:
+    Description: Current database configuration
+    Value: !Ref DatabaseType
+    
+  CostOptimization:
+    Description: Database cost optimization status
+    Value: !If
+      - IsAuroraV1
+      - !Sub "Aurora Serverless v1 - Auto-pause: ${CanPause} (£0/hour when paused)"
+      - !If
+        - IsAuroraV2
+        - "Aurora Serverless v2 - Min 0.5 ACU (£6.60/month minimum)"
+        - !If
+          - IsRDS
+          - !Sub "RDS t4g.micro - Auto-stop: ${CanPause} (£0/hour when stopped, £1.64/month storage)"
+          - "No database - £0/month"
+          
+  ZeroScalingCapable:
+    Description: Can this database scale to zero cost
+    Value: !If
+      - CanPause
+      - !If
+        - IsAuroraV1
+        - "Yes - Auto-pause to £0/hour"
+        - !If
+          - IsRDS
+          - "Yes - Auto-stop to £1.64/month (storage only)"
+          - "No"
+      - "No - Zero scaling disabled"

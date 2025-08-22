@@ -1,0 +1,399 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  ECS Compute Substack - True Zero Scaling Capable
+  
+  Supports scaling to 0 tasks for complete cost elimination when idle.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Description: Base name for all resources
+    
+  Environment:
+    Type: String
+    Description: Environment identifier
+    
+  GlobalStackName:
+    Type: String
+    Description: Name of the global stack for imports
+    
+  DesiredCount:
+    Type: Number
+    Default: 0
+    Description: Number of tasks to run (0 for idle)
+    MinValue: 0
+    
+  BackendCPU:
+    Type: String
+    Default: "256"
+    Description: Backend task CPU units
+    
+  BackendMemory:
+    Type: String
+    Default: "512"
+    Description: Backend task memory (MB)
+    
+  FrontendCPU:
+    Type: String
+    Default: "256"
+    Description: Frontend task CPU units
+    
+  FrontendMemory:
+    Type: String
+    Default: "512"
+    Description: Frontend task memory (MB)
+    
+  EnableALB:
+    Type: String
+    Default: "false"
+    Description: Enable Application Load Balancer integration
+    AllowedValues: ["true", "false"]
+    
+  EnableBlueGreen:
+    Type: String
+    Default: "false"
+    Description: Enable blue-green deployments
+    AllowedValues: ["true", "false"]
+    
+  # Dependencies from other substacks
+  DatabaseEndpoint:
+    Type: String
+    Default: ""
+    Description: Database endpoint from database substack
+    
+  DatabaseSecretArn:
+    Type: String
+    Default: ""
+    Description: Database secret ARN from database substack
+    
+  JWTSecretArn:
+    Type: String
+    Default: ""
+    Description: JWT secret ARN from secrets substack
+    
+  ALBTargetGroupArn:
+    Type: String
+    Default: ""
+    Description: ALB target group ARN from networking substack
+    
+  BackendLogGroup:
+    Type: String
+    Description: Backend log group ARN from logging substack
+    
+  FrontendLogGroup:
+    Type: String
+    Description: Frontend log group ARN from logging substack
+
+Conditions:
+  HasTasks: !Not [!Equals [!Ref DesiredCount, 0]]
+  HasALB: !Equals [!Ref EnableALB, "true"]
+  HasBlueGreen: !Equals [!Ref EnableBlueGreen, "true"]
+  HasDatabase: !Not [!Equals [!Ref DatabaseEndpoint, ""]]
+
+Resources:
+  # ECS Cluster with FARGATE_SPOT for cost optimization
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${ProjectName}-${Environment}-cluster"
+      CapacityProviders:
+        - FARGATE_SPOT
+        - FARGATE
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE_SPOT
+          Weight: 80  # Prioritize spot for maximum savings
+        - CapacityProvider: FARGATE  
+          Weight: 20
+
+  # Security Groups
+  BackendSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for backend service
+      VpcId:
+        Fn::ImportValue: !Sub "${GlobalStackName}-VPC"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3001
+          ToPort: 3001
+          CidrIp: 10.0.0.0/16
+          Description: Backend API access from VPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-backend-sg"
+
+  FrontendSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for frontend service
+      VpcId:
+        Fn::ImportValue: !Sub "${GlobalStackName}-VPC"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          CidrIp: 10.0.0.0/16
+          Description: Frontend access from VPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-frontend-sg"
+
+  # ECS Task Definitions
+  BackendTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${ProjectName}-${Environment}-backend"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      RuntimePlatform:
+        CpuArchitecture: ARM64
+        OperatingSystemFamily: LINUX
+      Cpu: !Ref BackendCPU
+      Memory: !Ref BackendMemory
+      ExecutionRoleArn: !Ref ECSTaskExecutionRole
+      TaskRoleArn: !Ref ECSTaskRole
+      ContainerDefinitions:
+        - Name: backend
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ProjectName}-backend:latest"
+          PortMappings:
+            - ContainerPort: 3001
+              Protocol: tcp
+          Environment:
+            - Name: NODE_ENV
+              Value: !Ref Environment
+            - Name: PORT
+              Value: "3001"
+            - Name: DB_HOST
+              Value: !Ref DatabaseEndpoint
+            - Name: DB_PORT
+              Value: "5432"
+            - Name: DB_NAME
+              Value: party_collection
+            - Name: FRONTEND_URL
+              Value: !If
+                - HasALB
+                - !Sub "http://alb.${Environment}.party-collection.local"
+                - "http://localhost:3000"
+          Secrets: !If
+            - HasDatabase
+            - - Name: DB_PASSWORD
+                ValueFrom: !Sub "${DatabaseSecretArn}:password::"
+              - Name: JWT_SECRET
+                ValueFrom: !Ref JWTSecretArn
+            - - Name: JWT_SECRET
+                ValueFrom: !Ref JWTSecretArn
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref BackendLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  FrontendTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${ProjectName}-${Environment}-frontend"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      RuntimePlatform:
+        CpuArchitecture: ARM64
+        OperatingSystemFamily: LINUX
+      Cpu: !Ref FrontendCPU
+      Memory: !Ref FrontendMemory
+      ExecutionRoleArn: !Ref ECSTaskExecutionRole
+      TaskRoleArn: !Ref ECSTaskRole
+      ContainerDefinitions:
+        - Name: frontend
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ProjectName}-frontend:latest"
+          PortMappings:
+            - ContainerPort: 3000
+              Protocol: tcp
+          Environment:
+            - Name: NODE_ENV
+              Value: !Ref Environment
+            - Name: NEXT_PUBLIC_API_URL
+              Value: !If
+                - HasALB
+                - !Sub "http://alb.${Environment}.party-collection.local"
+                - "http://localhost:3001"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref FrontendLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  # ECS Services - Only created when DesiredCount > 0
+  BackendService:
+    Type: AWS::ECS::Service
+    Condition: HasTasks
+    Properties:
+      ServiceName: !Sub "${ProjectName}-${Environment}-backend"
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref BackendTaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - !Ref BackendSecurityGroup
+          Subnets:
+            - Fn::ImportValue: !Sub "${GlobalStackName}-PrivateSubnet1"
+            - Fn::ImportValue: !Sub "${GlobalStackName}-PrivateSubnet2"
+      LoadBalancers: !If
+        - HasALB
+        - - TargetGroupArn: !Ref ALBTargetGroupArn
+            ContainerName: backend
+            ContainerPort: 3001
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  FrontendService:
+    Type: AWS::ECS::Service
+    Condition: HasTasks
+    Properties:
+      ServiceName: !Sub "${ProjectName}-${Environment}-frontend"
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref FrontendTaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - !Ref FrontendSecurityGroup
+          Subnets:
+            - Fn::ImportValue: !Sub "${GlobalStackName}-PrivateSubnet1"
+            - Fn::ImportValue: !Sub "${GlobalStackName}-PrivateSubnet2"
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Auto Scaling for true zero scaling capability
+  BackendAutoScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Condition: HasTasks
+    Properties:
+      MaxCapacity: 10
+      MinCapacity: 0  # TRUE ZERO SCALING
+      ResourceId: !Sub "service/${ECSCluster}/${BackendService.Name}"
+      RoleARN: !Ref AutoScalingRole
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  FrontendAutoScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Condition: HasTasks
+    Properties:
+      MaxCapacity: 10
+      MinCapacity: 0  # TRUE ZERO SCALING
+      ResourceId: !Sub "service/${ECSCluster}/${FrontendService.Name}"
+      RoleARN: !Ref AutoScalingRole
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  # IAM Roles
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: 
+                  - !Ref JWTSecretArn
+                  - !Ref DatabaseSecretArn
+
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Ref BackendLogGroup
+                  - !Ref FrontendLogGroup
+
+  AutoScalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: application-autoscaling.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSServiceRolePolicy
+
+Outputs:
+  ClusterName:
+    Description: ECS cluster name
+    Value: !Ref ECSCluster
+    
+  BackendServiceName:
+    Description: Backend service name (if running)
+    Value: !If
+      - HasTasks
+      - !Ref BackendService
+      - "Service scaled to zero"
+      
+  FrontendServiceName:
+    Description: Frontend service name (if running)
+    Value: !If
+      - HasTasks
+      - !Ref FrontendService
+      - "Service scaled to zero"
+      
+  TaskDefinitions:
+    Description: Task definition ARNs
+    Value: !Sub |
+      Backend: ${BackendTaskDefinition}
+      Frontend: ${FrontendTaskDefinition}
+      
+  ScalingStatus:
+    Description: Current scaling configuration
+    Value: !Sub |
+      Desired Count: ${DesiredCount}
+      Auto Scaling: Enabled (0-10)
+      Spot Instances: 80% weight
+      Cost When Idle: £0.00/month

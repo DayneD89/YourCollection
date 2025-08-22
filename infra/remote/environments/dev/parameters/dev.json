@@ -1,0 +1,11 @@
+{
+  "ProjectName": "party-collection",
+  "Environment": "dev",
+  "GlobalStackName": "party-collection-global",
+  "DomainName": "",
+  "DBInstanceClass": "db.t3.micro",
+  "ECSTaskCPU": "256",
+  "ECSTaskMemory": "512",
+  "BackendImage": "nginx:latest",
+  "FrontendImage": "nginx:latest"
+}

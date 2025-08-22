@@ -1,0 +1,53 @@
+# Party Collection Configuration
+# This is the centralized configuration file for the Party Collection application
+
+# Default Admin Account Configuration
+# Note: These credentials are used for local development and testing
+# In production, these should be overridden with secure values
+admin:
+  email: "admin@example.com"
+  password: "AdminTest123@"
+
+# Survey Form Configuration
+form:
+  title: "Party Collection Survey"
+  description: "Help us understand your preferences and gather information for our party collection."
+  fields:
+    - name: "full_name"
+      type: "text"
+      label: "Full Name"
+      placeholder: "Enter your full name"
+      required: true
+      sensitive: false
+    - name: "address"
+      type: "text"
+      label: "Address"
+      placeholder: "Enter your address"
+      required: true
+      sensitive: false
+    - name: "phone"
+      type: "text"
+      label: "Phone Number"
+      placeholder: "Enter your phone number"
+      required: false
+      sensitive: false
+    - name: "email"
+      type: "email"
+      label: "Email Address"
+      placeholder: "Enter your email address"
+      required: false
+      sensitive: false
+    - name: "party_support"
+      type: "slider"
+      label: "How likely are you to support our party?"
+      description: "Rate from 0 (not likely) to 10 (very likely)"
+      min: 0
+      max: 10
+      required: true
+      sensitive: true
+    - name: "newsletter"
+      type: "boolean"
+      label: "Subscribe to newsletter?"
+      description: "Receive updates about our party activities"
+      required: false
+      sensitive: false

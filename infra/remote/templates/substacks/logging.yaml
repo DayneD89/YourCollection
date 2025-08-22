@@ -1,0 +1,80 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Logging Substack - CloudWatch Log Groups
+  
+  Configurable log retention and conditional creation for cost optimization.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Description: Base name for all resources
+    
+  Environment:
+    Type: String
+    Description: Environment identifier
+    
+  RetentionInDays:
+    Type: Number
+    Default: 3
+    Description: CloudWatch log retention in days
+    
+  EnableZeroScaling:
+    Type: String
+    Default: "true"
+    Description: Enable cost optimization features
+    AllowedValues: ["true", "false"]
+
+Resources:
+  # Backend Log Group
+  BackendLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/ecs/${ProjectName}-${Environment}-backend"
+      RetentionInDays: !Ref RetentionInDays
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: Backend
+
+  # Frontend Log Group
+  FrontendLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/ecs/${ProjectName}-${Environment}-frontend"
+      RetentionInDays: !Ref RetentionInDays
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: Frontend
+
+  # Database Log Group (optional)
+  DatabaseLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/rds/instance/${ProjectName}-${Environment}/postgresql"
+      RetentionInDays: !Ref RetentionInDays
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Component
+          Value: Database
+
+Outputs:
+  BackendLogGroup:
+    Description: Backend log group name
+    Value: !Ref BackendLogGroup
+    
+  FrontendLogGroup:
+    Description: Frontend log group name
+    Value: !Ref FrontendLogGroup
+    
+  DatabaseLogGroup:
+    Description: Database log group name
+    Value: !Ref DatabaseLogGroup
+    
+  LogRetention:
+    Description: Log retention configuration
+    Value: !Sub "${RetentionInDays} days retention"

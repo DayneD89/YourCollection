@@ -1,0 +1,41 @@
+{
+  "name": "party-collection-webapp",
+  "version": "0.1.0",
+  "description": "A Progressive Web Application enabling party members to collect information from the public through YAML-configurable dynamic forms for political campaigning purposes.",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint",
+    "test": "node ../test/runner.js",
+    "test:e2e": "node ../test/runner.js",
+    "test:e2e:headed": "HEADLESS=false node ../test/runner.js",
+    "test:e2e:debug": "DEBUG=true HEADLESS=false node ../test/runner.js",
+    "test:comprehensive": "node ../test/comprehensive-test.js",
+    "test:all": "node ../test/test-runner.js --env=local",
+    "test:all:dev": "node ../test/test-runner.js --env=dev",
+    "test:all:prod": "node ../test/test-runner.js --env=prod",
+    "report": "node ../test/generate-tag-report.js",
+    "report:dev": "node ../test/generate-tag-report.js",
+    "report:prod": "node ../test/generate-tag-report.js"
+  },
+  "dependencies": {
+    "jsonwebtoken": "^9.0.2",
+    "next": "^15.5.2",
+    "next-pwa": "^5.6.0",
+    "react": "19.1.0",
+    "react-dom": "19.1.0"
+  },
+  "devDependencies": {
+    "@eslint/eslintrc": "^3",
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "eslint": "^9",
+    "eslint-config-next": "15.5.0",
+    "tailwindcss": "^4",
+    "typescript": "^5"
+  }
+}

@@ -1,0 +1,1120 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Party Collection Production - Blue/Green Deployments with Enhanced Security
+  
+  Features: Blue/Green deployments, comprehensive health checks, secure authentication,
+  structured CloudWatch logging, and automated rollback capabilities.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: party-collection
+    Description: Base name for all resources
+    
+  Environment:
+    Type: String
+    Default: prod
+    Description: Environment identifier
+    
+  GlobalStackName:
+    Type: String
+    Default: party-collection-global
+    Description: Name of the global stack for imports
+    
+  DomainName:
+    Type: String
+    Default: party-collection.com
+    Description: Custom domain name for production
+    
+  CertificateArn:
+    Type: String
+    Default: ""
+    Description: ARN of SSL certificate for custom domain
+    
+  # Database Configuration
+  AuroraMinCapacity:
+    Type: Number
+    Default: 0.5
+    Description: Minimum Aurora Serverless v2 capacity (ACU)
+    
+  AuroraMaxCapacity:
+    Type: Number
+    Default: 8
+    Description: Maximum Aurora Serverless v2 capacity (ACU)
+    
+  EnableRDSProxy:
+    Type: String
+    Default: "true"
+    Description: Enable RDS Proxy for connection pooling
+    AllowedValues: ["true", "false"]
+    
+  # Backend Configuration
+  BackendTaskCPU:
+    Type: String
+    Default: "512"
+    Description: Backend ECS task CPU units
+    
+  BackendTaskMemory:
+    Type: String
+    Default: "1024"
+    Description: Backend ECS task memory (MB)
+    
+  BackendMinCapacity:
+    Type: Number
+    Default: 2
+    Description: Minimum backend tasks (increased for blue/green)
+    
+  BackendMaxCapacity:
+    Type: Number
+    Default: 20
+    Description: Maximum backend tasks
+    
+  # Frontend Configuration
+  FrontendTaskCPU:
+    Type: String
+    Default: "512"
+    Description: Frontend ECS task CPU units
+    
+  FrontendTaskMemory:
+    Type: String
+    Default: "1024"
+    Description: Frontend ECS task memory (MB)
+    
+  FrontendMinCapacity:
+    Type: Number
+    Default: 2
+    Description: Minimum frontend tasks (increased for blue/green)
+    
+  FrontendMaxCapacity:
+    Type: Number
+    Default: 30
+    Description: Maximum frontend tasks
+    
+  # Deployment Configuration
+  DeploymentTimeoutMinutes:
+    Type: Number
+    Default: 10
+    Description: Timeout for blue/green deployment in minutes
+    
+  HealthCheckGracePeriodSeconds:
+    Type: Number
+    Default: 300
+    Description: Grace period for health checks during deployment
+    
+  # Container Images
+  BackendImage:
+    Type: String
+    Default: "nginx:latest"
+    Description: Backend container image URI
+    
+  FrontendImage:
+    Type: String
+    Default: "nginx:latest"
+    Description: Frontend container image URI
+
+Conditions:
+  HasCustomDomain: !Not [!Equals [!Ref DomainName, ""]]
+  HasCertificate: !Not [!Equals [!Ref CertificateArn, ""]]
+  EnableRDSProxyCondition: !Equals [!Ref EnableRDSProxy, "true"]
+
+Resources:
+  # Enhanced ECS Cluster for Blue/Green deployments
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${ProjectName}-${Environment}-cluster"
+      CapacityProviders:
+        - FARGATE_SPOT
+        - FARGATE
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 2  # More on-demand for production stability
+        - CapacityProvider: FARGATE_SPOT
+          Weight: 1  # Some spot for cost optimization
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Configuration:
+        ExecuteCommandConfiguration:
+          Logging: OVERRIDE
+          LogConfiguration:
+            CloudWatchLogGroupName: !Ref ECSExecLogGroup
+            S3BucketName: 
+              Fn::ImportValue: !Sub "${GlobalStackName}-CodeArtifactsBucket"
+            S3KeyPrefix: "ecs-exec-logs"
+
+  # CloudWatch Log Groups for comprehensive logging
+  ECSExecLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/ecs/exec/${ProjectName}-${Environment}"
+      RetentionInDays: 14
+
+  BackendLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${ProjectName}-${Environment}-backend"
+      RetentionInDays: 14
+
+  FrontendLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${ProjectName}-${Environment}-frontend"
+      RetentionInDays: 14
+
+  DeploymentLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/deployment/${ProjectName}-${Environment}"
+      RetentionInDays: 14
+
+  SecurityLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/security/${ProjectName}-${Environment}"
+      RetentionInDays: 14
+
+  # Aurora Serverless v2 with enhanced monitoring
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for Aurora Serverless database
+      SubnetIds:
+        - Fn::ImportValue: !Sub "${GlobalStackName}-PrivateSubnet1"
+        - Fn::ImportValue: !Sub "${GlobalStackName}-PrivateSubnet2"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-db-subnet-group"
+
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Aurora database
+      VpcId:
+        Fn::ImportValue: !Sub "${GlobalStackName}-VPC"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref BackendSecurityGroup
+          Description: PostgreSQL access from backend tasks
+        - !If
+          - EnableRDSProxyCondition
+          - IpProtocol: tcp
+            FromPort: 5432
+            ToPort: 5432
+            SourceSecurityGroupId: !Ref RDSProxySecurityGroup
+            Description: PostgreSQL access from RDS Proxy
+          - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-db-sg"
+
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Snapshot
+    Properties:
+      DBClusterIdentifier: !Sub "${ProjectName}-${Environment}-aurora"
+      Engine: aurora-postgresql
+      EngineVersion: "15.4"
+      EngineMode: provisioned
+      DatabaseName: party_collection
+      MasterUsername: postgres
+      ManageMasterUserPassword: true
+      VpcSecurityGroupIds:
+        - !Ref DBSecurityGroup
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      BackupRetentionPeriod: 7
+      PreferredBackupWindow: "03:00-04:00"
+      PreferredMaintenanceWindow: "sun:04:00-sun:05:00"
+      DeletionProtection: true
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: !Ref AuroraMinCapacity
+        MaxCapacity: !Ref AuroraMaxCapacity
+      EnableCloudwatchLogsExports:
+        - postgresql
+      MonitoringInterval: 60
+      MonitoringRoleArn: !GetAtt RDSEnhancedMonitoringRole.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-aurora"
+
+  AuroraInstanceWriter:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub "${ProjectName}-${Environment}-aurora-writer"
+      DBClusterIdentifier: !Ref AuroraCluster
+      DBInstanceClass: db.serverless
+      Engine: aurora-postgresql
+      PubliclyAccessible: false
+      MonitoringInterval: 60
+      MonitoringRoleArn: !GetAtt RDSEnhancedMonitoringRole.Arn
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: 7
+
+  RDSEnhancedMonitoringRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: monitoring.rds.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole
+
+  # RDS Proxy for secure database connections
+  RDSProxySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: EnableRDSProxyCondition
+    Properties:
+      GroupDescription: Security group for RDS Proxy
+      VpcId:
+        Fn::ImportValue: !Sub "${GlobalStackName}-VPC"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref BackendSecurityGroup
+          Description: PostgreSQL access from backend tasks
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-rds-proxy-sg"
+
+  RDSProxyRole:
+    Type: AWS::IAM::Role
+    Condition: EnableRDSProxyCondition
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: rds.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: RDSProxyPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rds-db:connect
+                Resource: !Sub "arn:aws:rds-db:${AWS::Region}:${AWS::AccountId}:dbuser:${AuroraCluster}/postgres"
+
+  RDSProxy:
+    Type: AWS::RDS::DBProxy
+    Condition: EnableRDSProxyCondition
+    Properties:
+      DBProxyName: !Sub "${ProjectName}-${Environment}-proxy"
+      EngineFamily: POSTGRESQL
+      Auth:
+        - AuthScheme: SECRETS
+          SecretArn: !Ref AuroraCluster.MasterUserSecret
+      RoleArn: !GetAtt RDSProxyRole.Arn
+      VpcSecurityGroupIds:
+        - !Ref RDSProxySecurityGroup
+      VpcSubnetIds:
+        - Fn::ImportValue: !Sub "${GlobalStackName}-PrivateSubnet1"
+        - Fn::ImportValue: !Sub "${GlobalStackName}-PrivateSubnet2"
+      TargetGroups:
+        - DBClusterIdentifiers:
+            - !Ref AuroraCluster
+      IdleClientTimeout: 1800
+      MaxConnectionsPercent: 90
+      MaxIdleConnectionsPercent: 50
+      RequireTLS: true
+
+  # Enhanced Security Groups
+  BackendSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for backend ECS tasks
+      VpcId:
+        Fn::ImportValue: !Sub "${GlobalStackName}-VPC"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3001
+          ToPort: 3001
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: Backend API access from ALB
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS outbound for AWS APIs
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          DestinationSecurityGroupId: !Ref DBSecurityGroup
+          Description: Database access
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-backend-sg"
+
+  FrontendSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for frontend ECS tasks
+      VpcId:
+        Fn::ImportValue: !Sub "${GlobalStackName}-VPC"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: Frontend access from ALB
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS outbound for AWS APIs
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-frontend-sg"
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Application Load Balancer
+      VpcId:
+        Fn::ImportValue: !Sub "${GlobalStackName}-VPC"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP access from anywhere
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS access from anywhere
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-alb-sg"
+
+  # Application Load Balancer with enhanced health checks
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-alb"
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Subnets:
+        - Fn::ImportValue: !Sub "${GlobalStackName}-PublicSubnet1"
+        - Fn::ImportValue: !Sub "${GlobalStackName}-PublicSubnet2"
+      LoadBalancerAttributes:
+        - Key: access_logs.s3.enabled
+          Value: "true"
+        - Key: access_logs.s3.bucket
+          Value: 
+            Fn::ImportValue: !Sub "${GlobalStackName}-CodeArtifactsBucket"
+        - Key: access_logs.s3.prefix
+          Value: !Sub "alb-logs/${Environment}"
+        - Key: deletion_protection.enabled
+          Value: "true"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-alb"
+
+  # Enhanced Target Groups for Blue/Green deployments
+  BackendTargetGroupBlue:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-backend-blue"
+      Port: 3001
+      Protocol: HTTP
+      VpcId:
+        Fn::ImportValue: !Sub "${GlobalStackName}-VPC"
+      TargetType: ip
+      HealthCheckEnabled: true
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 10
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: "200,201"
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+        - Key: load_balancing.algorithm.type
+          Value: least_outstanding_requests
+        - Key: slow_start.duration_seconds
+          Value: "60"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-backend-blue"
+
+  BackendTargetGroupGreen:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-backend-green"
+      Port: 3001
+      Protocol: HTTP
+      VpcId:
+        Fn::ImportValue: !Sub "${GlobalStackName}-VPC"
+      TargetType: ip
+      HealthCheckEnabled: true
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 10
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: "200,201"
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+        - Key: load_balancing.algorithm.type
+          Value: least_outstanding_requests
+        - Key: slow_start.duration_seconds
+          Value: "60"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-backend-green"
+
+  FrontendTargetGroupBlue:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-frontend-blue"
+      Port: 3000
+      Protocol: HTTP
+      VpcId:
+        Fn::ImportValue: !Sub "${GlobalStackName}-VPC"
+      TargetType: ip
+      HealthCheckEnabled: true
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 10
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: "200,201"
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+        - Key: load_balancing.algorithm.type
+          Value: least_outstanding_requests
+        - Key: slow_start.duration_seconds
+          Value: "60"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-frontend-blue"
+
+  FrontendTargetGroupGreen:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-frontend-green"
+      Port: 3000
+      Protocol: HTTP
+      VpcId:
+        Fn::ImportValue: !Sub "${GlobalStackName}-VPC"
+      TargetType: ip
+      HealthCheckEnabled: true
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 10
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: "200,201"
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+        - Key: load_balancing.algorithm.type
+          Value: least_outstanding_requests
+        - Key: slow_start.duration_seconds
+          Value: "60"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-frontend-green"
+
+  # ALB Listeners with HTTPS support
+  ALBListenerHTTPS:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasCertificate
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref FrontendTargetGroupBlue  # Default to blue
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+      SslPolicy: ELBSecurityPolicy-TLS-1-2-2017-01
+
+  ALBListenerHTTP:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - !If
+          - HasCertificate
+          - Type: redirect
+            RedirectConfig:
+              Protocol: HTTPS
+              Port: "443"
+              StatusCode: HTTP_301
+          - Type: forward
+            TargetGroupArn: !Ref FrontendTargetGroupBlue
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  # Backend routing rules
+  BackendListenerRuleHTTPS:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Condition: HasCertificate
+    Properties:
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref BackendTargetGroupBlue  # Default to blue
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - "/api/*"
+            - "/health"
+      ListenerArn: !Ref ALBListenerHTTPS
+      Priority: 100
+
+  BackendListenerRuleHTTP:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Condition: !Not [!Condition HasCertificate]
+    Properties:
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref BackendTargetGroupBlue
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - "/api/*"
+            - "/health"
+      ListenerArn: !Ref ALBListenerHTTP
+      Priority: 100
+
+  # Enhanced IAM Roles with security best practices
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:RequestedRegion': !Ref AWS::Region
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: SecureSecretsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref AuroraCluster.MasterUserSecret
+                  - !Ref JWTSecret
+                  - !Ref SessionSecret
+                Condition:
+                  StringEquals:
+                    'secretsmanager:ResourceTag/Environment': !Ref Environment
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: 
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/${ProjectName}-${Environment}-*"
+
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ApplicationPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: 
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/${ProjectName}-${Environment}-*"
+              - Effect: Allow
+                Action:
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    'aws:RequestedRegion': !Ref AWS::Region
+
+  # Secure secrets management
+  JWTSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-jwt-secret"
+      Description: JWT secret for authentication
+      GenerateSecretString:
+        PasswordLength: 64
+        ExcludeCharacters: '"@/\'
+        IncludeSpace: false
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: JWT-Authentication
+
+  SessionSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-session-secret"
+      Description: Session secret for secure session management
+      GenerateSecretString:
+        PasswordLength: 64
+        ExcludeCharacters: '"@/\'
+        IncludeSpace: false
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Session-Management
+
+  # Backend Task Definition with enhanced security
+  BackendTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${ProjectName}-${Environment}-backend"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !Ref BackendTaskCPU
+      Memory: !Ref BackendTaskMemory
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      ContainerDefinitions:
+        - Name: backend
+          Image: !Ref BackendImage
+          PortMappings:
+            - ContainerPort: 3001
+              Protocol: tcp
+          Environment:
+            - Name: NODE_ENV
+              Value: production
+            - Name: PORT
+              Value: "3001"
+            - Name: DB_HOST
+              Value: !If
+                - EnableRDSProxyCondition
+                - !GetAtt RDSProxy.Endpoint
+                - !GetAtt AuroraCluster.Endpoint.Address
+            - Name: DB_PORT
+              Value: "5432"
+            - Name: DB_NAME
+              Value: party_collection
+            - Name: DB_USER
+              Value: postgres
+            - Name: FRONTEND_URL
+              Value: !If
+                - HasCustomDomain
+                - !Sub "https://${DomainName}"
+                - !Sub "https://${ApplicationLoadBalancer.DNSName}"
+            - Name: LOG_LEVEL
+              Value: info
+            - Name: ENABLE_REQUEST_LOGGING
+              Value: "true"
+            - Name: SECURITY_HEADERS_ENABLED
+              Value: "true"
+          Secrets:
+            - Name: DB_PASSWORD
+              ValueFrom: !Sub "${AuroraCluster.MasterUserSecret}:password::"
+            - Name: JWT_SECRET
+              ValueFrom: !Ref JWTSecret
+            - Name: SESSION_SECRET
+              ValueFrom: !Ref SessionSecret
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref BackendLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: backend
+              awslogs-datetime-format: "%Y-%m-%d %H:%M:%S"
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - "curl -f http://localhost:3001/health || exit 1"
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+          Essential: true
+          ReadonlyRootFilesystem: true
+          User: "1001:1001"
+
+  # Frontend Task Definition with enhanced security
+  FrontendTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${ProjectName}-${Environment}-frontend"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !Ref FrontendTaskCPU
+      Memory: !Ref FrontendTaskMemory
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      ContainerDefinitions:
+        - Name: frontend
+          Image: !Ref FrontendImage
+          PortMappings:
+            - ContainerPort: 3000
+              Protocol: tcp
+          Environment:
+            - Name: NODE_ENV
+              Value: production
+            - Name: NEXT_PUBLIC_API_URL
+              Value: !If
+                - HasCustomDomain
+                - !Sub "https://${DomainName}"
+                - !Sub "https://${ApplicationLoadBalancer.DNSName}"
+            - Name: NEXT_PUBLIC_DEBUG
+              Value: "false"
+            - Name: LOG_LEVEL
+              Value: info
+            - Name: NEXT_TELEMETRY_DISABLED
+              Value: "1"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref FrontendLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: frontend
+              awslogs-datetime-format: "%Y-%m-%d %H:%M:%S"
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - "curl -f http://localhost:3000/ || exit 1"
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+          Essential: true
+          ReadonlyRootFilesystem: true
+          User: "1001:1001"
+
+  # Blue/Green ECS Services (Initially Blue)
+  BackendServiceBlue:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ALBListenerHTTP
+      - BackendListenerRuleHTTP
+    Properties:
+      ServiceName: !Sub "${ProjectName}-${Environment}-backend-blue"
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref BackendTaskDefinition
+      DesiredCount: !Ref BackendMinCapacity
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100  # Ensure no downtime
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      HealthCheckGracePeriodSeconds: !Ref HealthCheckGracePeriodSeconds
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - !Ref BackendSecurityGroup
+          Subnets:
+            - Fn::ImportValue: !Sub "${GlobalStackName}-PrivateSubnet1"
+            - Fn::ImportValue: !Sub "${GlobalStackName}-PrivateSubnet2"
+          AssignPublicIp: DISABLED
+      LoadBalancers:
+        - ContainerName: backend
+          ContainerPort: 3001
+          TargetGroupArn: !Ref BackendTargetGroupBlue
+      ServiceRegistries:
+        - RegistryArn: !GetAtt BackendServiceDiscovery.Arn
+          ContainerName: backend
+      EnableExecuteCommand: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-backend-blue"
+        - Key: DeploymentColor
+          Value: blue
+
+  FrontendServiceBlue:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ALBListenerHTTP
+    Properties:
+      ServiceName: !Sub "${ProjectName}-${Environment}-frontend-blue"
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref FrontendTaskDefinition
+      DesiredCount: !Ref FrontendMinCapacity
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      HealthCheckGracePeriodSeconds: !Ref HealthCheckGracePeriodSeconds
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - !Ref FrontendSecurityGroup
+          Subnets:
+            - Fn::ImportValue: !Sub "${GlobalStackName}-PrivateSubnet1"
+            - Fn::ImportValue: !Sub "${GlobalStackName}-PrivateSubnet2"
+          AssignPublicIp: DISABLED
+      LoadBalancers:
+        - ContainerName: frontend
+          ContainerPort: 3000
+          TargetGroupArn: !Ref FrontendTargetGroupBlue
+      ServiceRegistries:
+        - RegistryArn: !GetAtt FrontendServiceDiscovery.Arn
+          ContainerName: frontend
+      EnableExecuteCommand: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-frontend-blue"
+        - Key: DeploymentColor
+          Value: blue
+
+  # Service Discovery for internal communication
+  ServiceDiscoveryNamespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}.local"
+      Vpc:
+        Fn::ImportValue: !Sub "${GlobalStackName}-VPC"
+      Description: Service discovery namespace for internal service communication
+
+  BackendServiceDiscovery:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: backend
+      NamespaceId: !Ref ServiceDiscoveryNamespace
+      DnsConfig:
+        DnsRecords:
+          - Type: A
+            TTL: 60
+        NamespaceId: !Ref ServiceDiscoveryNamespace
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+
+  FrontendServiceDiscovery:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: frontend
+      NamespaceId: !Ref ServiceDiscoveryNamespace
+      DnsConfig:
+        DnsRecords:
+          - Type: A
+            TTL: 60
+        NamespaceId: !Ref ServiceDiscoveryNamespace
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+
+  # Auto Scaling with enhanced metrics
+  BackendScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: !Ref BackendMaxCapacity
+      MinCapacity: !Ref BackendMinCapacity
+      ResourceId: !Sub "service/${ECSCluster}/${BackendServiceBlue.Name}"
+      RoleARN: !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService"
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  BackendCPUScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub "${ProjectName}-${Environment}-backend-cpu-scaling"
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref BackendScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        TargetValue: 60
+        ScaleInCooldown: 300
+        ScaleOutCooldown: 60
+
+  FrontendScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: !Ref FrontendMaxCapacity
+      MinCapacity: !Ref FrontendMinCapacity
+      ResourceId: !Sub "service/${ECSCluster}/${FrontendServiceBlue.Name}"
+      RoleARN: !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService"
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  FrontendCPUScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub "${ProjectName}-${Environment}-frontend-cpu-scaling"
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref FrontendScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        TargetValue: 60
+        ScaleInCooldown: 300
+        ScaleOutCooldown: 60
+
+  # Enhanced CloudWatch Alarms for monitoring
+  BackendDeploymentFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${Environment}-backend-deployment-failure"
+      AlarmDescription: Backend deployment failure detection
+      MetricName: RunningTaskCount
+      Namespace: AWS/ECS
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: !Ref BackendMinCapacity
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: ServiceName
+          Value: !GetAtt BackendServiceBlue.Name
+        - Name: ClusterName
+          Value: !Ref ECSCluster
+      AlarmActions:
+        - !Ref DeploymentFailureTopic
+
+  FrontendDeploymentFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${Environment}-frontend-deployment-failure"
+      AlarmDescription: Frontend deployment failure detection
+      MetricName: RunningTaskCount
+      Namespace: AWS/ECS
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: !Ref FrontendMinCapacity
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: ServiceName
+          Value: !GetAtt FrontendServiceBlue.Name
+        - Name: ClusterName
+          Value: !Ref ECSCluster
+      AlarmActions:
+        - !Ref DeploymentFailureTopic
+
+  # SNS Topic for deployment notifications
+  DeploymentFailureTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-${Environment}-deployment-failures"
+      DisplayName: Deployment Failure Notifications
+
+Outputs:
+  LoadBalancerDNS:
+    Description: DNS name of the load balancer
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub "${AWS::StackName}-LoadBalancerDNS"
+
+  LoadBalancerURL:
+    Description: Full URL of the application
+    Value: !If
+      - HasCertificate
+      - !Sub "https://${ApplicationLoadBalancer.DNSName}"
+      - !Sub "http://${ApplicationLoadBalancer.DNSName}"
+
+  DatabaseEndpoint:
+    Description: Aurora cluster endpoint
+    Value: !GetAtt AuroraCluster.Endpoint.Address
+    Export:
+      Name: !Sub "${AWS::StackName}-DatabaseEndpoint"
+
+  RDSProxyEndpoint:
+    Condition: EnableRDSProxyCondition
+    Description: RDS Proxy endpoint
+    Value: !GetAtt RDSProxy.Endpoint
+    Export:
+      Name: !Sub "${AWS::StackName}-RDSProxyEndpoint"
+
+  BackendServiceBlue:
+    Description: Backend Blue service name
+    Value: !GetAtt BackendServiceBlue.Name
+    Export:
+      Name: !Sub "${AWS::StackName}-BackendServiceBlue"
+
+  BackendTargetGroupBlue:
+    Description: Backend Blue target group ARN
+    Value: !Ref BackendTargetGroupBlue
+    Export:
+      Name: !Sub "${AWS::StackName}-BackendTargetGroupBlue"
+
+  BackendTargetGroupGreen:
+    Description: Backend Green target group ARN
+    Value: !Ref BackendTargetGroupGreen
+    Export:
+      Name: !Sub "${AWS::StackName}-BackendTargetGroupGreen"
+
+  FrontendServiceBlue:
+    Description: Frontend Blue service name
+    Value: !GetAtt FrontendServiceBlue.Name
+    Export:
+      Name: !Sub "${AWS::StackName}-FrontendServiceBlue"
+
+  FrontendTargetGroupBlue:
+    Description: Frontend Blue target group ARN
+    Value: !Ref FrontendTargetGroupBlue
+    Export:
+      Name: !Sub "${AWS::StackName}-FrontendTargetGroupBlue"
+
+  FrontendTargetGroupGreen:
+    Description: Frontend Green target group ARN
+    Value: !Ref FrontendTargetGroupGreen
+    Export:
+      Name: !Sub "${AWS::StackName}-FrontendTargetGroupGreen"
+
+  ECSClusterName:
+    Description: ECS cluster name
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub "${AWS::StackName}-ECSCluster"
+
+  ServiceDiscoveryNamespace:
+    Description: Service discovery namespace
+    Value: !Ref ServiceDiscoveryNamespace
+    Export:
+      Name: !Sub "${AWS::StackName}-ServiceDiscoveryNamespace"

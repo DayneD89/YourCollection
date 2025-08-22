@@ -1,0 +1,694 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Party Collection Development Environment - Optimized for Independent Scaling and UK Region
+  
+  Features: Independent frontend/backend scaling, RDS Proxy for DB scaling,
+  scale-to-zero capabilities, and UK region cost optimization.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: party-collection
+    Description: Base name for all resources
+    
+  Environment:
+    Type: String
+    Default: dev
+    Description: Environment identifier
+    
+  GlobalStackName:
+    Type: String
+    Default: party-collection-global
+    Description: Name of the global stack for imports
+    
+  DomainName:
+    Type: String
+    Default: ""
+    Description: Custom domain name (optional for dev)
+    
+  # Database Configuration
+  DBInstanceClass:
+    Type: String
+    Default: db.t4g.micro
+    Description: RDS instance class (ARM-based for cost savings in UK)
+    
+  EnableRDSProxy:
+    Type: String
+    Default: "true"
+    Description: Enable RDS Proxy for connection pooling and scaling
+    AllowedValues: ["true", "false"]
+    
+  # Backend Scaling Configuration
+  BackendTaskCPU:
+    Type: String
+    Default: "256"
+    Description: Backend ECS task CPU units
+    
+  BackendTaskMemory:
+    Type: String
+    Default: "512"
+    Description: Backend ECS task memory (MB)
+    
+  BackendMinCapacity:
+    Type: Number
+    Default: 0
+    Description: Minimum backend tasks (0 for scale-to-zero)
+    
+  BackendMaxCapacity:
+    Type: Number
+    Default: 5
+    Description: Maximum backend tasks
+    
+  BackendTargetCPU:
+    Type: Number
+    Default: 70
+    Description: Target CPU utilization for backend scaling
+    
+  # Frontend Scaling Configuration  
+  FrontendTaskCPU:
+    Type: String
+    Default: "256"
+    Description: Frontend ECS task CPU units
+    
+  FrontendTaskMemory:
+    Type: String
+    Default: "512"
+    Description: Frontend ECS task memory (MB)
+    
+  FrontendMinCapacity:
+    Type: Number
+    Default: 0
+    Description: Minimum frontend tasks (0 for scale-to-zero)
+    
+  FrontendMaxCapacity:
+    Type: Number
+    Default: 5
+    Description: Maximum frontend tasks
+    
+  FrontendTargetCPU:
+    Type: Number
+    Default: 70
+    Description: Target CPU utilization for frontend scaling
+    
+  # Container Images
+  BackendImage:
+    Type: String
+    Default: "nginx:latest"
+    Description: Backend container image URI
+    
+  FrontendImage:
+    Type: String
+    Default: "nginx:latest"
+    Description: Frontend container image URI
+
+Conditions:
+  HasCustomDomain: !Not [!Equals [!Ref DomainName, ""]]
+  EnableRDSProxyCondition: !Equals [!Ref EnableRDSProxy, "true"]
+
+Resources:
+  # ECS Cluster optimized for UK region cost savings
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${ProjectName}-${Environment}-cluster"
+      CapacityProviders:
+        - FARGATE_SPOT  # Prioritize Spot for cost savings
+        - FARGATE
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE_SPOT
+          Weight: 4  # 80% Spot instances
+        - CapacityProvider: FARGATE
+          Weight: 1  # 20% On-demand for stability
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+
+  # Aurora Serverless v2 for automatic scaling (UK optimized)
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for Aurora Serverless database
+      SubnetIds:
+        - Fn::ImportValue: !Sub "${GlobalStackName}-PrivateSubnet1"
+        - Fn::ImportValue: !Sub "${GlobalStackName}-PrivateSubnet2"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-db-subnet-group"
+
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Aurora database
+      VpcId:
+        Fn::ImportValue: !Sub "${GlobalStackName}-VPC"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref BackendSecurityGroup
+          Description: PostgreSQL access from backend tasks
+        - !If
+          - EnableRDSProxyCondition
+          - IpProtocol: tcp
+            FromPort: 5432
+            ToPort: 5432
+            SourceSecurityGroupId: !Ref RDSProxySecurityGroup
+            Description: PostgreSQL access from RDS Proxy
+          - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-db-sg"
+
+  # Aurora Serverless v2 Cluster for automatic scaling
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Delete  # Development environment
+    Properties:
+      DBClusterIdentifier: !Sub "${ProjectName}-${Environment}-aurora"
+      Engine: aurora-postgresql
+      EngineVersion: "15.4"
+      EngineMode: provisioned  # Required for Serverless v2
+      DatabaseName: party_collection
+      MasterUsername: postgres
+      ManageMasterUserPassword: true  # AWS managed password
+      VpcSecurityGroupIds:
+        - !Ref DBSecurityGroup
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      BackupRetentionPeriod: 1  # Minimal for dev
+      DeletionProtection: false
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: 0.5  # 0.5 ACU minimum (very low cost)
+        MaxCapacity: 2    # 2 ACU maximum for dev
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-aurora"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Aurora Serverless v2 Writer Instance
+  AuroraInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub "${ProjectName}-${Environment}-aurora-writer"
+      DBClusterIdentifier: !Ref AuroraCluster
+      DBInstanceClass: db.serverless  # Serverless v2 instance class
+      Engine: aurora-postgresql
+      PubliclyAccessible: false
+
+  # RDS Proxy for connection pooling and scaling
+  RDSProxySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: EnableRDSProxyCondition
+    Properties:
+      GroupDescription: Security group for RDS Proxy
+      VpcId:
+        Fn::ImportValue: !Sub "${GlobalStackName}-VPC"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref BackendSecurityGroup
+          Description: PostgreSQL access from backend tasks
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-rds-proxy-sg"
+
+  RDSProxyRole:
+    Type: AWS::IAM::Role
+    Condition: EnableRDSProxyCondition
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: rds.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: RDSProxyPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rds-db:connect
+                Resource: !Sub "arn:aws:rds-db:${AWS::Region}:${AWS::AccountId}:dbuser:${AuroraCluster}/postgres"
+
+  RDSProxy:
+    Type: AWS::RDS::DBProxy
+    Condition: EnableRDSProxyCondition
+    Properties:
+      DBProxyName: !Sub "${ProjectName}-${Environment}-proxy"
+      EngineFamily: POSTGRESQL
+      Auth:
+        - AuthScheme: SECRETS
+          SecretArn: !Ref AuroraCluster.MasterUserSecret
+      RoleArn: !GetAtt RDSProxyRole.Arn
+      VpcSecurityGroupIds:
+        - !Ref RDSProxySecurityGroup
+      VpcSubnetIds:
+        - Fn::ImportValue: !Sub "${GlobalStackName}-PrivateSubnet1"
+        - Fn::ImportValue: !Sub "${GlobalStackName}-PrivateSubnet2"
+      TargetGroups:
+        - DBClusterIdentifiers:
+            - !Ref AuroraCluster
+      IdleClientTimeout: 1800  # 30 minutes
+      MaxConnectionsPercent: 80
+      MaxIdleConnectionsPercent: 50
+      RequireTLS: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-rds-proxy"
+
+  # Backend Security Group
+  BackendSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for backend ECS tasks
+      VpcId:
+        Fn::ImportValue: !Sub "${GlobalStackName}-VPC"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3001
+          ToPort: 3001
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: Backend API access from ALB
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-backend-sg"
+
+  # Frontend Security Group
+  FrontendSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for frontend ECS tasks
+      VpcId:
+        Fn::ImportValue: !Sub "${GlobalStackName}-VPC"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: Frontend access from ALB
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-frontend-sg"
+
+  # Application Load Balancer
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Application Load Balancer
+      VpcId:
+        Fn::ImportValue: !Sub "${GlobalStackName}-VPC"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP access from anywhere
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS access from anywhere
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-alb-sg"
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-alb"
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Subnets:
+        - Fn::ImportValue: !Sub "${GlobalStackName}-PublicSubnet1"
+        - Fn::ImportValue: !Sub "${GlobalStackName}-PublicSubnet2"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-alb"
+
+  # Target Groups
+  BackendTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-backend-tg"
+      Port: 3001
+      Protocol: HTTP
+      VpcId:
+        Fn::ImportValue: !Sub "${GlobalStackName}-VPC"
+      TargetType: ip
+      HealthCheckEnabled: true
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2  # Faster scale-down
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"  # Faster task replacement
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-backend-tg"
+
+  FrontendTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-frontend-tg"
+      Port: 3000
+      Protocol: HTTP
+      VpcId:
+        Fn::ImportValue: !Sub "${GlobalStackName}-VPC"
+      TargetType: ip
+      HealthCheckEnabled: true
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-frontend-tg"
+
+  # ALB Listeners
+  ALBListenerHTTP:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref FrontendTargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  # Backend routing rule
+  BackendListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref BackendTargetGroup
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - "/api/*"
+            - "/health"
+      ListenerArn: !Ref ALBListenerHTTP
+      Priority: 100
+
+  # ECS Task Execution Role
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref AuroraCluster.MasterUserSecret
+                  - !Ref JWTSecret
+
+  # Backend Task Definition
+  BackendTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${ProjectName}-${Environment}-backend"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !Ref BackendTaskCPU
+      Memory: !Ref BackendTaskMemory
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: backend
+          Image: !Ref BackendImage
+          PortMappings:
+            - ContainerPort: 3001
+              Protocol: tcp
+          Environment:
+            - Name: NODE_ENV
+              Value: development
+            - Name: PORT
+              Value: "3001"
+            - Name: DB_HOST
+              Value: !If
+                - EnableRDSProxyCondition
+                - !GetAtt RDSProxy.Endpoint
+                - !GetAtt AuroraCluster.Endpoint.Address
+            - Name: DB_PORT
+              Value: "5432"
+            - Name: DB_NAME
+              Value: party_collection
+            - Name: DB_USER
+              Value: postgres
+            - Name: FRONTEND_URL
+              Value: !Sub "http://${ApplicationLoadBalancer.DNSName}"
+          Secrets:
+            - Name: DB_PASSWORD
+              ValueFrom: !Sub "${AuroraCluster.MasterUserSecret}:password::"
+            - Name: JWT_SECRET
+              ValueFrom: !Ref JWTSecret
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref BackendLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          Essential: true
+
+  # Frontend Task Definition
+  FrontendTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${ProjectName}-${Environment}-frontend"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !Ref FrontendTaskCPU
+      Memory: !Ref FrontendTaskMemory
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: frontend
+          Image: !Ref FrontendImage
+          PortMappings:
+            - ContainerPort: 3000
+              Protocol: tcp
+          Environment:
+            - Name: NODE_ENV
+              Value: development
+            - Name: NEXT_PUBLIC_API_URL
+              Value: !Sub "http://${ApplicationLoadBalancer.DNSName}"
+            - Name: NEXT_PUBLIC_DEBUG
+              Value: "false"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref FrontendLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          Essential: true
+
+  # JWT Secret
+  JWTSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-jwt-secret"
+      Description: JWT secret for authentication
+      GenerateSecretString:
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\'
+
+  # Backend ECS Service with independent scaling
+  BackendService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ALBListenerHTTP
+      - BackendListenerRule
+    Properties:
+      ServiceName: !Sub "${ProjectName}-${Environment}-backend"
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref BackendTaskDefinition
+      DesiredCount: !Ref BackendMinCapacity
+      LaunchType: FARGATE
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 0  # Allow scale-to-zero
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - !Ref BackendSecurityGroup
+          Subnets:
+            - Fn::ImportValue: !Sub "${GlobalStackName}-PrivateSubnet1"
+            - Fn::ImportValue: !Sub "${GlobalStackName}-PrivateSubnet2"
+          AssignPublicIp: DISABLED
+      LoadBalancers:
+        - ContainerName: backend
+          ContainerPort: 3001
+          TargetGroupArn: !Ref BackendTargetGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-backend"
+
+  # Frontend ECS Service with independent scaling
+  FrontendService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ALBListenerHTTP
+    Properties:
+      ServiceName: !Sub "${ProjectName}-${Environment}-frontend"
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref FrontendTaskDefinition
+      DesiredCount: !Ref FrontendMinCapacity
+      LaunchType: FARGATE
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 0  # Allow scale-to-zero
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - !Ref FrontendSecurityGroup
+          Subnets:
+            - Fn::ImportValue: !Sub "${GlobalStackName}-PrivateSubnet1"
+            - Fn::ImportValue: !Sub "${GlobalStackName}-PrivateSubnet2"
+          AssignPublicIp: DISABLED
+      LoadBalancers:
+        - ContainerName: frontend
+          ContainerPort: 3000
+          TargetGroupArn: !Ref FrontendTargetGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-frontend"
+
+  # Backend Auto Scaling
+  BackendScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: !Ref BackendMaxCapacity
+      MinCapacity: !Ref BackendMinCapacity
+      ResourceId: !Sub "service/${ECSCluster}/${BackendService.Name}"
+      RoleARN: !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService"
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  BackendScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub "${ProjectName}-${Environment}-backend-cpu-scaling"
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref BackendScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        TargetValue: !Ref BackendTargetCPU
+        ScaleInCooldown: 180  # Faster scale-in for cost savings
+        ScaleOutCooldown: 60   # Faster scale-out for responsiveness
+
+  # Frontend Auto Scaling
+  FrontendScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: !Ref FrontendMaxCapacity
+      MinCapacity: !Ref FrontendMinCapacity
+      ResourceId: !Sub "service/${ECSCluster}/${FrontendService.Name}"
+      RoleARN: !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService"
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  FrontendScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub "${ProjectName}-${Environment}-frontend-cpu-scaling"
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref FrontendScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        TargetValue: !Ref FrontendTargetCPU
+        ScaleInCooldown: 180
+        ScaleOutCooldown: 60
+
+  # CloudWatch Log Groups
+  BackendLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${ProjectName}-${Environment}-backend"
+      RetentionInDays: 7
+
+  FrontendLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${ProjectName}-${Environment}-frontend"
+      RetentionInDays: 7
+
+Outputs:
+  LoadBalancerDNS:
+    Description: DNS name of the load balancer
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub "${AWS::StackName}-LoadBalancerDNS"
+
+  LoadBalancerURL:
+    Description: Full URL of the application
+    Value: !Sub "http://${ApplicationLoadBalancer.DNSName}"
+
+  DatabaseEndpoint:
+    Description: Aurora cluster endpoint
+    Value: !GetAtt AuroraCluster.Endpoint.Address
+    Export:
+      Name: !Sub "${AWS::StackName}-DatabaseEndpoint"
+
+  RDSProxyEndpoint:
+    Condition: EnableRDSProxyCondition
+    Description: RDS Proxy endpoint for connection pooling
+    Value: !GetAtt RDSProxy.Endpoint
+    Export:
+      Name: !Sub "${AWS::StackName}-RDSProxyEndpoint"
+
+  BackendServiceName:
+    Description: Name of the backend ECS service
+    Value: !GetAtt BackendService.Name
+    Export:
+      Name: !Sub "${AWS::StackName}-BackendService"
+
+  FrontendServiceName:
+    Description: Name of the frontend ECS service
+    Value: !GetAtt FrontendService.Name
+    Export:
+      Name: !Sub "${AWS::StackName}-FrontendService"
+
+  ECSClusterName:
+    Description: Name of the ECS cluster
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub "${AWS::StackName}-ECSCluster"

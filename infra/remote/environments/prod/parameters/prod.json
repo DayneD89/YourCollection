@@ -1,0 +1,14 @@
+{
+  "ProjectName": "party-collection",
+  "Environment": "prod",
+  "GlobalStackName": "party-collection-global",
+  "DomainName": "party-collection.com",
+  "CertificateArn": "",
+  "DBInstanceClass": "db.t3.small",
+  "ECSTaskCPU": "512",
+  "ECSTaskMemory": "1024",
+  "BackendImage": "nginx:latest",
+  "FrontendImage": "nginx:latest",
+  "MinCapacity": 2,
+  "MaxCapacity": 10
+}

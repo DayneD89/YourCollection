@@ -1,0 +1,339 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Party Collection Environment - Parent Template
+  
+  Orchestrates substacks for complete environment deployment with configurable
+  scaling, cost optimization, and optional components.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: party-collection
+    Description: Base name for all resources
+    
+  Environment:
+    Type: String
+    Description: Environment identifier (dev, prod)
+    AllowedValues: [dev, prod]
+    
+  GlobalStackName:
+    Type: String
+    Default: party-collection-global
+    Description: Name of the global stack for imports
+    
+  # Master Environment Control
+  EnvironmentEnabled:
+    Type: String
+    Default: "true"
+    Description: Master switch to enable/disable entire environment
+    AllowedValues: ["true", "false"]
+    
+  # Scaling Configuration
+  EnableZeroScaling:
+    Type: String
+    Default: "true"
+    Description: Enable scaling to zero for cost optimization
+    AllowedValues: ["true", "false"]
+    
+  DesiredCount:
+    Type: Number
+    Default: 0
+    Description: Number of tasks to run (0 for idle, 1+ for active)
+    MinValue: 0
+    MaxValue: 50
+    
+  # Database Configuration  
+  DatabaseType:
+    Type: String
+    Default: aurora-v1
+    Description: Database type for cost optimization
+    AllowedValues: [aurora-v1, aurora-v2, rds, none]
+    
+  DatabaseMinCapacity:
+    Type: Number
+    Default: 1
+    Description: Minimum database capacity
+    
+  DatabaseMaxCapacity:
+    Type: Number
+    Default: 8
+    Description: Maximum database capacity
+    
+  # Compute Configuration
+  BackendCPU:
+    Type: String
+    Default: "256"
+    Description: Backend task CPU units
+    
+  BackendMemory:
+    Type: String
+    Default: "512"
+    Description: Backend task memory (MB)
+    
+  FrontendCPU:
+    Type: String
+    Default: "256"
+    Description: Frontend task CPU units
+    
+  FrontendMemory:
+    Type: String
+    Default: "512"
+    Description: Frontend task memory (MB)
+    
+  # Optional Components
+  EnableALB:
+    Type: String
+    Default: "false"
+    Description: Enable Application Load Balancer
+    AllowedValues: ["true", "false"]
+    
+  EnableBlueGreen:
+    Type: String
+    Default: "false"
+    Description: Enable blue-green deployments (requires ALB)
+    AllowedValues: ["true", "false"]
+    
+  EnableRDSProxy:
+    Type: String
+    Default: "false"
+    Description: Enable RDS Proxy for connection pooling
+    AllowedValues: ["true", "false"]
+    
+  # Logging Configuration
+  LogRetentionDays:
+    Type: Number
+    Default: 3
+    Description: CloudWatch log retention in days
+    
+  # Domain Configuration (optional)
+  DomainName:
+    Type: String
+    Default: ""
+    Description: Custom domain name (leave empty for none)
+    
+  CertificateArn:
+    Type: String
+    Default: ""
+    Description: SSL certificate ARN (leave empty for none)
+    
+  # Cost Management
+  MonthlyBudgetLimit:
+    Type: Number
+    Default: 100
+    Description: Monthly budget limit in GBP for this environment
+    
+  AlertEmail:
+    Type: String
+    Default: admin@party-collection.local
+    Description: Email for budget alerts
+    
+  EnableCostManagement:
+    Type: String
+    Default: "true"
+    Description: Enable cost monitoring and alerts
+    AllowedValues: ["true", "false"]
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, "prod"]
+  IsDevelopment: !Equals [!Ref Environment, "dev"]
+  EnvironmentOn: !Equals [!Ref EnvironmentEnabled, "true"]
+  HasALB: !And
+    - !Equals [!Ref EnableALB, "true"]
+    - !Condition EnvironmentOn
+  HasBlueGreen: !And
+    - !Equals [!Ref EnableBlueGreen, "true"]
+    - !Condition HasALB
+    - !Condition EnvironmentOn
+  HasDatabase: !And
+    - !Not [!Equals [!Ref DatabaseType, "none"]]
+    - !Condition EnvironmentOn
+  IsRunning: !And
+    - !Not [!Equals [!Ref DesiredCount, 0]]
+    - !Condition EnvironmentOn
+  HasDomain: !Not [!Equals [!Ref DomainName, ""]]
+  HasCostManagement: !And
+    - !Equals [!Ref EnableCostManagement, "true"]
+    - !Condition EnvironmentOn
+
+Resources:
+  # Logging Substack (Always created for basic monitoring)
+  LoggingStack:
+    Type: AWS::CloudFormation::Stack
+    Condition: EnvironmentOn
+    Properties:
+      TemplateURL: !Sub "https://${GlobalStackName}-templates.s3.${AWS::Region}.amazonaws.com/substacks/logging.yaml"
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        RetentionInDays: !Ref LogRetentionDays
+        EnableZeroScaling: !Ref EnableZeroScaling
+      Tags:
+        - Key: Component
+          Value: Logging
+
+  # Secrets Substack
+  SecretsStack:
+    Type: AWS::CloudFormation::Stack
+    Condition: IsRunning
+    Properties:
+      TemplateURL: !Sub "https://${GlobalStackName}-templates.s3.${AWS::Region}.amazonaws.com/substacks/secrets.yaml"
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+      Tags:
+        - Key: Component
+          Value: Secrets
+
+  # Database Substack
+  DatabaseStack:
+    Type: AWS::CloudFormation::Stack
+    Condition: HasDatabase
+    Properties:
+      TemplateURL: !Sub "https://${GlobalStackName}-templates.s3.${AWS::Region}.amazonaws.com/substacks/database.yaml"
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        GlobalStackName: !Ref GlobalStackName
+        DatabaseType: !Ref DatabaseType
+        MinCapacity: !Ref DatabaseMinCapacity
+        MaxCapacity: !Ref DatabaseMaxCapacity
+        EnableRDSProxy: !Ref EnableRDSProxy
+        EnableZeroScaling: !Ref EnableZeroScaling
+      Tags:
+        - Key: Component
+          Value: Database
+
+  # Networking Substack (ALB + Security Groups)
+  NetworkingStack:
+    Type: AWS::CloudFormation::Stack
+    Condition: HasALB
+    Properties:
+      TemplateURL: !Sub "https://${GlobalStackName}-templates.s3.${AWS::Region}.amazonaws.com/substacks/networking.yaml"
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        GlobalStackName: !Ref GlobalStackName
+        EnableBlueGreen: !Ref EnableBlueGreen
+        DomainName: !Ref DomainName
+        CertificateArn: !Ref CertificateArn
+      Tags:
+        - Key: Component
+          Value: Networking
+
+  # Compute Substack (ECS Cluster + Services)
+  ComputeStack:
+    Type: AWS::CloudFormation::Stack
+    Condition: IsRunning
+    Properties:
+      TemplateURL: !Sub "https://${GlobalStackName}-templates.s3.${AWS::Region}.amazonaws.com/substacks/compute.yaml"
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        GlobalStackName: !Ref GlobalStackName
+        DesiredCount: !Ref DesiredCount
+        BackendCPU: !Ref BackendCPU
+        BackendMemory: !Ref BackendMemory
+        FrontendCPU: !Ref FrontendCPU
+        FrontendMemory: !Ref FrontendMemory
+        EnableALB: !Ref EnableALB
+        EnableBlueGreen: !Ref EnableBlueGreen
+        DatabaseEndpoint: !If
+          - HasDatabase
+          - !GetAtt DatabaseStack.Outputs.DatabaseEndpoint
+          - ""
+        DatabaseSecretArn: !If
+          - HasDatabase
+          - !GetAtt DatabaseStack.Outputs.DatabaseSecretArn
+          - ""
+        JWTSecretArn: !If
+          - IsRunning
+          - !GetAtt SecretsStack.Outputs.JWTSecretArn
+          - ""
+        ALBTargetGroupArn: !If
+          - HasALB
+          - !GetAtt NetworkingStack.Outputs.TargetGroupArn
+          - ""
+        BackendLogGroup: !If
+          - EnvironmentOn
+          - !GetAtt LoggingStack.Outputs.BackendLogGroup
+          - ""
+        FrontendLogGroup: !If
+          - EnvironmentOn
+          - !GetAtt LoggingStack.Outputs.FrontendLogGroup
+          - ""
+      Tags:
+        - Key: Component
+          Value: Compute
+
+  # Cost Management Substack
+  CostManagementStack:
+    Type: AWS::CloudFormation::Stack
+    Condition: HasCostManagement
+    Properties:
+      TemplateURL: !Sub "https://${GlobalStackName}-templates.s3.${AWS::Region}.amazonaws.com/substacks/cost-management.yaml"
+      Parameters:
+        ProjectName: !Ref ProjectName
+        Environment: !Ref Environment
+        MonthlyBudgetLimit: !Ref MonthlyBudgetLimit
+        AlertEmail: !Ref AlertEmail
+        EmergencyShutdownThreshold: 95
+      Tags:
+        - Key: Component
+          Value: CostManagement
+
+Outputs:
+  StackStatus:
+    Description: Current stack configuration
+    Value: !Sub |
+      Environment: ${Environment}
+      Environment Enabled: ${EnvironmentEnabled}
+      Running: ${DesiredCount} tasks
+      Database: ${DatabaseType}
+      ALB: ${EnableALB}
+      Blue-Green: ${EnableBlueGreen}
+      
+  DatabaseEndpoint:
+    Description: Database endpoint (if enabled)
+    Value: !If
+      - HasDatabase
+      - !GetAtt DatabaseStack.Outputs.DatabaseEndpoint
+      - !If
+        - EnvironmentOn
+        - "No database configured"
+        - "Environment disabled"
+    
+  ApplicationURL:
+    Description: Application access URL
+    Value: !If
+      - EnvironmentOn
+      - !If
+        - HasALB
+        - !If
+          - HasDomain
+          - !Sub "https://${DomainName}"
+          - !Sub "http://${NetworkingStack.Outputs.ALBDNSName}"
+        - !If
+          - IsRunning
+          - "Access via ECS service endpoints"
+          - "Application scaled to zero"
+      - "Environment disabled - no access"
+        
+  CostOptimization:
+    Description: Current cost optimization status
+    Value: !Sub |
+      Environment Enabled: ${EnvironmentEnabled}
+      Zero Scaling: ${EnableZeroScaling}
+      Current Tasks: ${DesiredCount}
+      Database Type: ${DatabaseType}
+      Log Retention: ${LogRetentionDays} days
+      Estimated Monthly Cost: £0.00 when disabled
+      
+  ManagementCommands:
+    Description: Environment management commands
+    Value: !Sub |
+      Disable Environment: aws cloudformation update-stack --stack-name ${AWS::StackName} --use-previous-template --parameters ParameterKey=EnvironmentEnabled,ParameterValue=false
+      Enable Environment: aws cloudformation update-stack --stack-name ${AWS::StackName} --use-previous-template --parameters ParameterKey=EnvironmentEnabled,ParameterValue=true
+      Scale Up: aws cloudformation update-stack --stack-name ${AWS::StackName} --use-previous-template --parameters ParameterKey=DesiredCount,ParameterValue=1
+      Scale Down: aws cloudformation update-stack --stack-name ${AWS::StackName} --use-previous-template --parameters ParameterKey=DesiredCount,ParameterValue=0
+      Enable ALB: aws cloudformation update-stack --stack-name ${AWS::StackName} --use-previous-template --parameters ParameterKey=EnableALB,ParameterValue=true

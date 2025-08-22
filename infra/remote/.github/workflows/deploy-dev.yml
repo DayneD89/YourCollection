@@ -1,0 +1,339 @@
+name: Deploy Development Environment
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_deploy:
+        description: 'Force deployment even if no changes detected'
+        required: false
+        default: false
+        type: boolean
+  push:
+    branches:
+      - develop
+      - 'feature/**'
+    paths:
+      - 'backend/**'
+      - 'frontend/**'
+      - 'infra/remote/environments/dev/**'
+      - '.github/workflows/deploy-dev.yml'
+  pull_request:
+    branches:
+      - develop
+    types: [opened, synchronize]
+
+env:
+  AWS_REGION: us-east-1
+  SAM_CLI_TELEMETRY: 0
+  ENVIRONMENT: dev
+
+# Required for OIDC authentication
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    outputs:
+      backend-image: ${{ steps.build.outputs.backend-image }}
+      frontend-image: ${{ steps.build.outputs.frontend-image }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: |
+            backend/package-lock.json
+            frontend/package-lock.json
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/party-collection-github-actions-role
+          role-session-name: GitHubActions-DevBuild
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Install backend dependencies
+        run: |
+          cd backend
+          npm ci
+
+      - name: Install frontend dependencies
+        run: |
+          cd frontend
+          npm ci
+
+      - name: Run backend tests
+        run: |
+          cd backend
+          npm test
+
+      - name: Build and push backend container
+        id: build-backend
+        run: |
+          cd backend
+          
+          # Create Dockerfile if it doesn't exist
+          if [ ! -f Dockerfile ]; then
+            cat > Dockerfile << 'EOF'
+          FROM node:18-alpine
+          WORKDIR /app
+          COPY package*.json ./
+          RUN npm ci --only=production
+          COPY . .
+          RUN npm run build
+          EXPOSE 3001
+          CMD ["npm", "start"]
+          EOF
+          fi
+          
+          # Build and push image
+          IMAGE_URI=${{ steps.login-ecr.outputs.registry }}/party-collection-backend:${{ env.ENVIRONMENT }}-${{ github.sha }}
+          docker build -t $IMAGE_URI .
+          docker push $IMAGE_URI
+          echo "backend-image=$IMAGE_URI" >> $GITHUB_OUTPUT
+
+      - name: Build and push frontend container
+        id: build-frontend
+        run: |
+          cd frontend
+          
+          # Create Dockerfile if it doesn't exist
+          if [ ! -f Dockerfile ]; then
+            cat > Dockerfile << 'EOF'
+          FROM node:18-alpine AS builder
+          WORKDIR /app
+          COPY package*.json ./
+          RUN npm ci
+          COPY . .
+          RUN npm run build
+          
+          FROM node:18-alpine
+          WORKDIR /app
+          COPY package*.json ./
+          RUN npm ci --only=production
+          COPY --from=builder /app/.next ./.next
+          COPY --from=builder /app/public ./public
+          EXPOSE 3000
+          CMD ["npm", "start"]
+          EOF
+          fi
+          
+          # Build and push image
+          IMAGE_URI=${{ steps.login-ecr.outputs.registry }}/party-collection-frontend:${{ env.ENVIRONMENT }}-${{ github.sha }}
+          docker build -t $IMAGE_URI .
+          docker push $IMAGE_URI
+          echo "frontend-image=$IMAGE_URI" >> $GITHUB_OUTPUT
+
+      - name: Set build outputs
+        id: build
+        run: |
+          echo "backend-image=${{ steps.build-backend.outputs.backend-image }}" >> $GITHUB_OUTPUT
+          echo "frontend-image=${{ steps.build-frontend.outputs.frontend-image }}" >> $GITHUB_OUTPUT
+
+  deploy-infrastructure:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    if: github.event_name != 'pull_request'
+    environment: dev
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python for SAM CLI
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Setup SAM CLI
+        uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/party-collection-dev-deployment-role
+          role-session-name: GitHubActions-DevDeploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Validate SAM template
+        run: |
+          cd infra/remote/environments/dev
+          sam validate --lint
+
+      - name: Build SAM application
+        run: |
+          cd infra/remote/environments/dev
+          sam build --cached --parallel
+
+      - name: Deploy to AWS
+        run: |
+          cd infra/remote/environments/dev
+          sam deploy \
+            --stack-name party-collection-dev \
+            --capabilities CAPABILITY_IAM \
+            --region ${{ env.AWS_REGION }} \
+            --s3-bucket party-collection-sam-state-${{ secrets.AWS_ACCOUNT_ID }} \
+            --s3-prefix dev \
+            --parameter-overrides \
+              ProjectName=party-collection \
+              Environment=dev \
+              GlobalStackName=party-collection-global \
+              BackendImage=${{ needs.build-and-test.outputs.backend-image }} \
+              FrontendImage=${{ needs.build-and-test.outputs.frontend-image }} \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset
+
+      - name: Get deployment outputs
+        id: stack-outputs
+        run: |
+          aws cloudformation describe-stacks \
+            --stack-name party-collection-dev \
+            --query 'Stacks[0].Outputs' \
+            --output json > stack-outputs.json
+          
+          APP_URL=$(jq -r '.[] | select(.OutputKey=="LoadBalancerURL") | .OutputValue' stack-outputs.json)
+          echo "app-url=$APP_URL" >> $GITHUB_OUTPUT
+
+      - name: Wait for deployment to be healthy
+        run: |
+          echo "Waiting for application to be healthy..."
+          APP_URL="${{ steps.stack-outputs.outputs.app-url }}"
+          
+          # Wait for health check to pass
+          for i in {1..30}; do
+            if curl -sf "$APP_URL/health" > /dev/null 2>&1; then
+              echo "✅ Application is healthy!"
+              break
+            fi
+            echo "Waiting for health check... (attempt $i/30)"
+            sleep 10
+          done
+
+  run-e2e-tests:
+    runs-on: ubuntu-latest
+    needs: [build-and-test, deploy-infrastructure]
+    if: github.event_name != 'pull_request'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/party-collection-github-actions-role
+          role-session-name: GitHubActions-DevTest
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get deployment URL
+        id: get-url
+        run: |
+          APP_URL=$(aws cloudformation describe-stacks \
+            --stack-name party-collection-dev \
+            --query 'Stacks[0].Outputs[?OutputKey==`LoadBalancerURL`].OutputValue' \
+            --output text)
+          echo "app-url=$APP_URL" >> $GITHUB_OUTPUT
+
+      - name: Install frontend dependencies
+        run: |
+          cd frontend
+          npm ci
+
+      - name: Run E2E tests against deployed environment
+        run: |
+          cd frontend
+          export NEXT_PUBLIC_API_URL="${{ steps.get-url.outputs.app-url }}"
+          export TEST_BASE_URL="${{ steps.get-url.outputs.app-url }}"
+          npm run test:e2e
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-test-results-dev
+          path: frontend/test/reports/
+
+  deployment-summary:
+    runs-on: ubuntu-latest
+    needs: [build-and-test, deploy-infrastructure, run-e2e-tests]
+    if: always() && github.event_name != 'pull_request'
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/party-collection-github-actions-role
+          role-session-name: GitHubActions-Summary
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get deployment details
+        id: deployment-info
+        run: |
+          APP_URL=$(aws cloudformation describe-stacks \
+            --stack-name party-collection-dev \
+            --query 'Stacks[0].Outputs[?OutputKey==`LoadBalancerURL`].OutputValue' \
+            --output text)
+          echo "app-url=$APP_URL" >> $GITHUB_OUTPUT
+
+      - name: Create deployment summary
+        run: |
+          echo "## Development Environment Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Resource | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | Development |" >> $GITHUB_STEP_SUMMARY
+          echo "| Application URL | ${{ steps.deployment-info.outputs.app-url }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Backend Image | ${{ needs.build-and-test.outputs.backend-image }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Frontend Image | ${{ needs.build-and-test.outputs.frontend-image }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Deployment Status | ${{ needs.deploy-infrastructure.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| E2E Tests Status | ${{ needs.run-e2e-tests.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Deployment Time | $(date -u) |" >> $GITHUB_STEP_SUMMARY
+
+  pr-comment:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    if: github.event_name == 'pull_request'
+    
+    steps:
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const comment = `## 🚀 Development Build Summary
+            
+            **Build Status:** ✅ Success
+            
+            **Container Images:**
+            - Backend: \`${{ needs.build-and-test.outputs.backend-image }}\`
+            - Frontend: \`${{ needs.build-and-test.outputs.frontend-image }}\`
+            
+            **Tests:** All backend tests passed
+            
+            > This PR build is ready for review. Deployment to dev environment will happen after merge.`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });

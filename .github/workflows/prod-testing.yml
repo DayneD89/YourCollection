@@ -1,0 +1,241 @@
+name: Production Testing & Reporting
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_production:
+        description: 'Type CONFIRM to run tests against production'
+        required: true
+        type: string
+  schedule:
+    # Run weekly on Sundays at 2 AM UTC
+    - cron: '0 2 * * 0'
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: prod-testing
+  cancel-in-progress: false
+
+jobs:
+  prod-testing:
+    runs-on: ubuntu-latest
+    environment: production
+    
+    steps:
+      - name: Verify production confirmation
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if [ "${{ github.event.inputs.confirm_production }}" != "CONFIRM" ]; then
+            echo "❌ Production testing requires CONFIRM input"
+            echo "Received: ${{ github.event.inputs.confirm_production }}"
+            exit 1
+          fi
+          echo "✅ Production testing confirmed"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: |
+            backend/package-lock.json
+            frontend/package-lock.json
+
+      - name: Install dependencies
+        run: |
+          cd backend && npm ci
+          cd ../frontend && npm ci
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          role-session-name: prod-testing-session
+          aws-region: eu-west-2
+
+      - name: Check production environment status
+        id: prod-status
+        run: |
+          STACK_NAME="party-collection-prod"
+          
+          # Check if stack exists
+          STACK_STATUS=$(aws cloudformation describe-stacks \
+              --stack-name "$STACK_NAME" \
+              --region eu-west-2 \
+              --query 'Stacks[0].StackStatus' \
+              --output text 2>/dev/null || echo "STACK_NOT_EXISTS")
+          
+          if [ "$STACK_STATUS" = "STACK_NOT_EXISTS" ]; then
+              echo "prod_exists=false" >> $GITHUB_OUTPUT
+              exit 0
+          fi
+          
+          # Check if services are healthy
+          BACKEND_URL=$(aws cloudformation describe-stacks \
+              --stack-name "$STACK_NAME" \
+              --region eu-west-2 \
+              --query "Stacks[0].Outputs[?OutputKey=='BackendURL'].OutputValue" \
+              --output text 2>/dev/null || echo "None")
+          
+          echo "prod_exists=true" >> $GITHUB_OUTPUT
+          echo "backend_url=$BACKEND_URL" >> $GITHUB_OUTPUT
+
+      - name: Wait for production services
+        if: steps.prod-status.outputs.prod_exists == 'true'
+        run: |
+          echo "⏳ Verifying production services are ready..."
+          BACKEND_URL="${{ steps.prod-status.outputs.backend_url }}"
+          
+          if [ "$BACKEND_URL" != "None" ] && [ -n "$BACKEND_URL" ]; then
+              echo "Backend URL: $BACKEND_URL"
+              # Quick health check
+              for i in {1..10}; do
+                  if curl -s "${BACKEND_URL}/health" | grep -q "healthy"; then
+                      echo "✅ Production backend is ready"
+                      break
+                  fi
+                  echo "  Attempt $i/10: Checking backend..."
+                  sleep 10
+              done
+          else
+              echo "⚠️ Backend URL not found in stack outputs"
+          fi
+
+      - name: Run smoke tests against production
+        if: steps.prod-status.outputs.prod_exists == 'true'
+        run: |
+          echo "🧪 Running smoke tests against production..."
+          echo "⚠️  Running limited test suite for production safety"
+          cd frontend
+          
+          # Set environment variable to indicate production testing
+          export CONFIRM_PROD_TESTING=true
+          
+          # Run production tests with longer timeout
+          timeout 900 npm run test:all:prod || exit 1
+
+      - name: Generate production test report
+        if: steps.prod-status.outputs.prod_exists == 'true'
+        run: |
+          echo "📊 Generating production test report..."
+          cd frontend
+          npm run report:prod
+
+      - name: Upload production report artifacts
+        if: steps.prod-status.outputs.prod_exists == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: prod-test-report-${{ github.run_number }}
+          path: |
+            reports/prod/latest/
+            reports/prod/history/
+          retention-days: 90
+
+      - name: Setup Pages
+        if: steps.prod-status.outputs.prod_exists == 'true'
+        uses: actions/configure-pages@v4
+
+      - name: Upload to GitHub Pages
+        if: steps.prod-status.outputs.prod_exists == 'true'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: reports/
+
+      - name: Deploy to GitHub Pages
+        if: steps.prod-status.outputs.prod_exists == 'true'
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Create issue on test failure
+        if: failure() && steps.prod-status.outputs.prod_exists == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = `🚨 Production Tests Failed - ${new Date().toISOString().split('T')[0]}`;
+            const body = `## Production Test Failure Alert
+            
+            **Date**: ${new Date().toISOString()}
+            **Workflow Run**: [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+            **Triggered by**: ${{ github.event_name }}
+            
+            ### Details
+            - Production smoke tests have failed
+            - This may indicate issues with the production environment
+            - Immediate investigation recommended
+            
+            ### Actions Required
+            1. Review test failure logs in the workflow run
+            2. Check production environment health
+            3. Verify recent deployments for potential issues
+            4. Consider rollback if critical functionality is affected
+            
+            ### Resources
+            - [View Test Report](https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/prod/latest/)
+            - [Production Monitoring](docs/infrastructure/monitoring.md)
+            - [Rollback Procedures](docs/deployment/rollback-procedures.md)
+            
+            **This issue was created automatically by the production testing workflow.**
+            `;
+            
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: title,
+              body: body,
+              labels: ['production', 'urgent', 'automated']
+            });
+
+      - name: Send notification on failure
+        if: failure() && steps.prod-status.outputs.prod_exists == 'true'
+        run: |
+          echo "🚨 PRODUCTION TEST FAILURE DETECTED"
+          echo "===================================="
+          echo ""
+          echo "Production environment tests have failed!"
+          echo "This requires immediate attention."
+          echo ""
+          echo "Actions taken:"
+          echo "- Created GitHub issue for tracking"
+          echo "- Test report uploaded to artifacts"
+          echo "- GitHub Pages updated with failure report"
+          echo ""
+          echo "Next steps:"
+          echo "1. Review the test failure logs above"
+          echo "2. Check the created GitHub issue"
+          echo "3. Investigate production environment health"
+          echo "4. Consider emergency procedures if needed"
+
+      - name: Report test success
+        if: steps.prod-status.outputs.prod_exists == 'true' && success()
+        run: |
+          echo "✅ PRODUCTION TESTS PASSED"
+          echo "========================="
+          echo ""
+          if [ -f "reports/prod/latest/combined-results.json" ]; then
+            TOTAL=$(cat reports/prod/latest/combined-results.json | grep -o '"total":[0-9]*' | head -1 | cut -d':' -f2)
+            PASSED=$(cat reports/prod/latest/combined-results.json | grep -o '"passed":[0-9]*' | head -1 | cut -d':' -f2)
+            DURATION=$(cat reports/prod/latest/combined-results.json | grep -o '"duration":[0-9]*' | head -1 | cut -d':' -f2)
+            DURATION_SEC=$((DURATION / 1000))
+            
+            echo "Test Results:"
+            echo "- Passed: $PASSED/$TOTAL tests"
+            echo "- Duration: ${DURATION_SEC}s"
+            echo "- Environment: Production"
+            echo ""
+          fi
+          echo "Production environment is healthy and functioning correctly."
+          echo "Report available at: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/prod/latest/"
+
+      - name: Environment not available
+        if: steps.prod-status.outputs.prod_exists == 'false'
+        run: |
+          echo "⚠️ Production environment not deployed."
+          echo "This is expected if production has not been set up yet."
+          echo "Skipping tests for this run."

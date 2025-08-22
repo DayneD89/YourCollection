@@ -1,0 +1,113 @@
+name: Deploy Global Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_deploy:
+        description: 'Force deployment even if no changes detected'
+        required: false
+        default: false
+        type: boolean
+  push:
+    branches:
+      - main
+    paths:
+      - 'infra/remote/global/**'
+      - '.github/workflows/deploy-global.yml'
+
+env:
+  AWS_REGION: us-east-1
+  SAM_CLI_TELEMETRY: 0
+
+# Required for OIDC authentication
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy-global:
+    runs-on: ubuntu-latest
+    environment: global
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python for SAM CLI
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Setup SAM CLI
+        uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/party-collection-github-actions-role
+          role-session-name: GitHubActions-GlobalDeploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Validate SAM template
+        run: |
+          cd infra/remote/global
+          sam validate --lint
+
+      - name: Build SAM application
+        run: |
+          cd infra/remote/global
+          sam build --cached --parallel
+
+      - name: Deploy to AWS
+        run: |
+          cd infra/remote/global
+          sam deploy \
+            --stack-name party-collection-global \
+            --capabilities CAPABILITY_IAM \
+            --region ${{ env.AWS_REGION }} \
+            --s3-bucket party-collection-sam-state-${{ secrets.AWS_ACCOUNT_ID }} \
+            --s3-prefix global \
+            --parameter-overrides \
+              ProjectName=party-collection \
+              GitHubOrg=${{ github.repository_owner }} \
+              GitHubRepo=${{ github.event.repository.name }} \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset
+
+      - name: Export stack outputs
+        id: stack-outputs
+        run: |
+          cd infra/remote/global
+          aws cloudformation describe-stacks \
+            --stack-name party-collection-global \
+            --query 'Stacks[0].Outputs' \
+            --output json > stack-outputs.json
+          
+          # Extract key outputs for use in dependent workflows
+          echo "code-bucket=$(jq -r '.[] | select(.OutputKey=="CodeArtifactsBucketName") | .OutputValue' stack-outputs.json)" >> $GITHUB_OUTPUT
+          echo "sam-bucket=$(jq -r '.[] | select(.OutputKey=="SAMStateBucketName") | .OutputValue' stack-outputs.json)" >> $GITHUB_OUTPUT
+          echo "frontend-bucket=$(jq -r '.[] | select(.OutputKey=="FrontendAssetsBucketName") | .OutputValue' stack-outputs.json)" >> $GITHUB_OUTPUT
+
+      - name: Create deployment summary
+        run: |
+          echo "## Global Infrastructure Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Resource | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Stack Name | party-collection-global |" >> $GITHUB_STEP_SUMMARY
+          echo "| Region | ${{ env.AWS_REGION }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Code Artifacts Bucket | ${{ steps.stack-outputs.outputs.code-bucket }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| SAM State Bucket | ${{ steps.stack-outputs.outputs.sam-bucket }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Frontend Assets Bucket | ${{ steps.stack-outputs.outputs.frontend-bucket }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Deployment Time | $(date -u) |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Notify deployment status
+        if: always()
+        run: |
+          if [ "${{ job.status }}" == "success" ]; then
+            echo "✅ Global infrastructure deployment successful"
+          else
+            echo "❌ Global infrastructure deployment failed"
+            exit 1
+          fi

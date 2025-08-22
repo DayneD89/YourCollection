@@ -1,0 +1,78 @@
+[
+  {
+    "ParameterKey": "ProjectName",
+    "ParameterValue": "party-collection"
+  },
+  {
+    "ParameterKey": "Environment",
+    "ParameterValue": "prod"
+  },
+  {
+    "ParameterKey": "GlobalStackName",
+    "ParameterValue": "party-collection-global"
+  },
+  {
+    "ParameterKey": "EnvironmentEnabled",
+    "ParameterValue": "false"
+  },
+  {
+    "ParameterKey": "EnableZeroScaling",
+    "ParameterValue": "false"
+  },
+  {
+    "ParameterKey": "DesiredCount",
+    "ParameterValue": "0"
+  },
+  {
+    "ParameterKey": "DatabaseType",
+    "ParameterValue": "none"
+  },
+  {
+    "ParameterKey": "DatabaseMinCapacity",
+    "ParameterValue": "1"
+  },
+  {
+    "ParameterKey": "DatabaseMaxCapacity",
+    "ParameterValue": "16"
+  },
+  {
+    "ParameterKey": "BackendCPU",
+    "ParameterValue": "512"
+  },
+  {
+    "ParameterKey": "BackendMemory",
+    "ParameterValue": "1024"
+  },
+  {
+    "ParameterKey": "FrontendCPU",
+    "ParameterValue": "512"
+  },
+  {
+    "ParameterKey": "FrontendMemory",
+    "ParameterValue": "1024"
+  },
+  {
+    "ParameterKey": "EnableALB",
+    "ParameterValue": "false"
+  },
+  {
+    "ParameterKey": "EnableBlueGreen",
+    "ParameterValue": "false"
+  },
+  {
+    "ParameterKey": "EnableRDSProxy",
+    "ParameterValue": "false"
+  },
+  {
+    "ParameterKey": "LogRetentionDays",
+    "ParameterValue": "14"
+  },
+  {
+    "ParameterKey": "DomainName",
+    "ParameterValue": ""
+  },
+  {
+    "ParameterKey": "CertificateArn",
+    "ParameterValue": ""
+  }
+]

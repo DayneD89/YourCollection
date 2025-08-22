@@ -1,0 +1,228 @@
+name: Dev Environment Testing & Reporting
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to test'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+        - dev
+  push:
+    branches: [ main ]
+    paths:
+      - 'frontend/**'
+      - 'backend/**'
+      - '.github/workflows/dev-testing.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'frontend/**'
+      - 'backend/**'
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: dev-testing-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dev-testing:
+    runs-on: ubuntu-latest
+    environment: dev
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: |
+            backend/package-lock.json
+            frontend/package-lock.json
+
+      - name: Install dependencies
+        run: |
+          cd backend && npm ci
+          cd ../frontend && npm ci
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          role-session-name: dev-testing-session
+          aws-region: eu-west-2
+
+      - name: Check dev environment status
+        id: dev-status
+        run: |
+          STACK_NAME="party-collection-dev-minimal"
+          
+          # Check if stack exists
+          STACK_STATUS=$(aws cloudformation describe-stacks \
+              --stack-name "$STACK_NAME" \
+              --region eu-west-2 \
+              --query 'Stacks[0].StackStatus' \
+              --output text 2>/dev/null || echo "STACK_NOT_EXISTS")
+          
+          if [ "$STACK_STATUS" = "STACK_NOT_EXISTS" ]; then
+              echo "dev_exists=false" >> $GITHUB_OUTPUT
+              echo "needs_scaling=false" >> $GITHUB_OUTPUT
+              exit 0
+          fi
+          
+          # Get current desired count
+          CURRENT_COUNT=$(aws cloudformation describe-stacks \
+              --stack-name "$STACK_NAME" \
+              --region eu-west-2 \
+              --query 'Stacks[0].Parameters[?ParameterKey==`DesiredCount`].ParameterValue' \
+              --output text 2>/dev/null || echo "0")
+          
+          echo "dev_exists=true" >> $GITHUB_OUTPUT
+          echo "current_count=$CURRENT_COUNT" >> $GITHUB_OUTPUT
+          echo "needs_scaling=$([ "$CURRENT_COUNT" = "0" ] && echo "true" || echo "false")" >> $GITHUB_OUTPUT
+
+      - name: Scale up dev environment
+        if: steps.dev-status.outputs.dev_exists == 'true' && steps.dev-status.outputs.needs_scaling == 'true'
+        run: |
+          echo "🔼 Scaling up dev environment from 0 to 1 container..."
+          cd infra/remote/tests
+          chmod +x dev-active.sh
+          ./dev-active.sh ${{ secrets.ALERT_EMAIL || 'admin@party-collection.local' }}
+
+      - name: Wait for services to be ready
+        if: steps.dev-status.outputs.dev_exists == 'true'
+        run: |
+          echo "⏳ Waiting for services to be ready..."
+          
+          # Get service IPs
+          STACK_NAME="party-collection-dev-minimal"
+          BACKEND_IP=$(aws cloudformation describe-stacks \
+              --stack-name "$STACK_NAME" \
+              --region eu-west-2 \
+              --query "Stacks[0].Outputs[?OutputKey=='BackendPublicIP'].OutputValue" \
+              --output text 2>/dev/null || echo "None")
+          
+          if [ "$BACKEND_IP" != "None" ]; then
+              echo "Backend IP: $BACKEND_IP"
+              # Wait for backend health check
+              for i in {1..30}; do
+                  if curl -s "http://$BACKEND_IP:3001/health" | grep -q "healthy"; then
+                      echo "✅ Backend is ready"
+                      break
+                  fi
+                  echo "  Attempt $i/30: Backend starting..."
+                  sleep 20
+              done
+          fi
+
+      - name: Run tests against dev environment
+        if: steps.dev-status.outputs.dev_exists == 'true'
+        run: |
+          echo "🧪 Running tests against dev environment..."
+          cd frontend
+          timeout 600 npm run test:all:dev || exit 1
+
+      - name: Generate dev test report
+        if: steps.dev-status.outputs.dev_exists == 'true'
+        run: |
+          echo "📊 Generating dev test report..."
+          cd frontend
+          npm run report:dev
+
+      - name: Scale down dev environment
+        if: steps.dev-status.outputs.dev_exists == 'true' && steps.dev-status.outputs.needs_scaling == 'true' && always()
+        run: |
+          echo "🔽 Scaling dev environment back to 0 containers..."
+          cd infra/remote/tests
+          chmod +x dev-idle.sh
+          ./dev-idle.sh ${{ secrets.ALERT_EMAIL || 'admin@party-collection.local' }}
+
+      - name: Upload dev report artifacts
+        if: steps.dev-status.outputs.dev_exists == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dev-test-report-${{ github.run_number }}
+          path: |
+            reports/dev/latest/
+            reports/dev/history/
+          retention-days: 30
+
+      - name: Setup Pages
+        if: steps.dev-status.outputs.dev_exists == 'true'
+        uses: actions/configure-pages@v4
+
+      - name: Upload to GitHub Pages
+        if: steps.dev-status.outputs.dev_exists == 'true'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: reports/
+
+      - name: Deploy to GitHub Pages
+        if: steps.dev-status.outputs.dev_exists == 'true' && github.ref == 'refs/heads/main'
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Add comment to PR
+        if: github.event_name == 'pull_request' && steps.dev-status.outputs.dev_exists == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let reportSummary = '';
+            
+            try {
+              const reportData = JSON.parse(fs.readFileSync('reports/dev/latest/combined-results.json', 'utf8'));
+              const { overall } = reportData;
+              const status = overall.status === 'passed' ? '✅' : '❌';
+              const rate = Math.round((overall.passed / overall.total) * 100);
+              
+              reportSummary = `## ${status} Dev Environment Test Results
+              
+              - **Status**: ${overall.status.toUpperCase()}
+              - **Success Rate**: ${rate}% (${overall.passed}/${overall.total} tests)
+              - **Duration**: ${Math.round(overall.duration/1000)}s
+              
+              [View Full Report](https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/dev/latest/)`;
+            } catch (error) {
+              reportSummary = `## ⚠️ Dev Environment Test Results
+              
+              Unable to parse test results. Check the workflow logs for details.`;
+            }
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: reportSummary
+            });
+
+      - name: Fail if tests failed
+        if: steps.dev-status.outputs.dev_exists == 'true'
+        run: |
+          if [ -f "reports/dev/latest/combined-results.json" ]; then
+            STATUS=$(cat reports/dev/latest/combined-results.json | grep -o '"status":"[^"]*' | cut -d'"' -f4)
+            if [ "$STATUS" != "passed" ]; then
+              echo "❌ Tests failed in dev environment"
+              exit 1
+            fi
+            echo "✅ All tests passed in dev environment"
+          else
+            echo "❌ No test results found"
+            exit 1
+          fi
+
+      - name: Environment not available
+        if: steps.dev-status.outputs.dev_exists == 'false'
+        run: |
+          echo "⚠️ Dev environment not deployed. Deploy first with:"
+          echo "   cd infra/remote/tests && ./dev-deploy.sh"
+          echo "Skipping tests for this run."

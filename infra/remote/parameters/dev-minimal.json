@@ -1,0 +1,46 @@
+[
+  {
+    "ParameterKey": "ProjectName",
+    "ParameterValue": "party-collection"
+  },
+  {
+    "ParameterKey": "Environment",
+    "ParameterValue": "dev"
+  },
+  {
+    "ParameterKey": "EnvironmentEnabled",
+    "ParameterValue": "true"
+  },
+  {
+    "ParameterKey": "DesiredCount",
+    "ParameterValue": "0"
+  },
+  {
+    "ParameterKey": "DatabaseType",
+    "ParameterValue": "aurora-v1"
+  },
+  {
+    "ParameterKey": "BackendCPU",
+    "ParameterValue": "256"
+  },
+  {
+    "ParameterKey": "BackendMemory",
+    "ParameterValue": "512"
+  },
+  {
+    "ParameterKey": "FrontendCPU",
+    "ParameterValue": "256"
+  },
+  {
+    "ParameterKey": "FrontendMemory",
+    "ParameterValue": "512"
+  },
+  {
+    "ParameterKey": "MonthlyBudgetLimit",
+    "ParameterValue": "10"
+  },
+  {
+    "ParameterKey": "AlertEmail",
+    "ParameterValue": "admin@party-collection.local"
+  }
+]
